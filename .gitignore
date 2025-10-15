@@ -1,0 +1,47 @@
+# Database files (usually large binary files)
+*.db
+*.sqlite
+*.sqlite3
+.git/
+
+# CSV data files
+*.csv
+
+# Compressed archives
+*.rar
+*.zip
+*.7z
+*.tar.gz
+
+# Model artifacts (can be large)
+artifacts/model_best.pt
+artifacts/scaler.pkl
+data_manager/exports/*.db
+data_manager/exports/*.csv
+data_manager/old_models
+
+# Logs
+logs/*.txt
+logs/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

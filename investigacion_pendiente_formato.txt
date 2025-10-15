@@ -1,0 +1,186 @@
+Puedes ampliar y referenciar este documento? Ten mucho cuidado de no introducir errores, y aprovecha para comprobar la validez de las afirmaciones. Ahora seras un doctor en filosofia experto en produccion cientifica, filosofia de la ciencia, latex, buenas practicas de publicacion (readings on physics y otras referencias) y con conocimiento del formato estandar de manejo de bibliografia, documentacion y profusion de detalles. Si hace falta, divide el trabajo en partes:
+"""
+\documentclass[11pt,a4paper]{article}
+\usepackage{hyphenat}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-tabla]{babel}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{listings}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{siunitx}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{float}
+\geometry{margin=2.5cm}
+
+\let\CheckCommand\providecommand
+\usepackage{microtype}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=red,
+  citecolor=green,
+  urlcolor=blue,
+  pdftitle={Heterocedasticidad en LSTM para Trading: Guía Completa},
+  pdfauthor={Autor},
+  pdfsubject={Documentación técnica ampliada}
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  postbreak=\mbox{\textcolor{red}{$\hookrightarrow$}\space},
+  showstringspaces=false,
+  language=Python
+}
+
+
+\title {Arquitectura de orquestación TRM: \\  \large Sistemas dinámicos heterocedásticos}
+\author{Santiago Javier Espino Heredero}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Se presenta una propuesta formal para una arquitectura de inteligencia artificial basada en la orquestación de $n$ Modelos Recursivos Pequeños (Tiny Recursive Models, TRM) interconectados, diseñada para abordar problemas científicos de alta complejidad en dominios como mecánica estadística, dinámica de fluidos, biología molecular, genética (CRISPR) e inmunología. Se desarrollan fundamentos matemáticos, estructura arquitectónica, estrategias de entrenamiento, análisis de estabilidad, implementación práctica y lineamientos para validación interdisciplinaria y ética.
+\end{abstract}
+\tableofcontents
+\section{Resumen Ejecutivo}
+La propuesta consiste en un sistema compuesto por $n$ módulos TRM, cada uno capaz de realizar iteraciones internas para resolver sub-problemas locales. Los módulos se comunican mediante canales de mensajes y convergen hacia soluciones cooperativas mediante iteración conjunta (síncrona o asincrónica).
+
+\textbf{Ventajas:}
+\begin{itemize}[noitemsep]
+  \item Eficiencia computacional: pequeños módulos reemplazan a un modelo monolítico.
+  \item Modularidad y explicabilidad.
+  \item Escalabilidad mediante sparsidad y paralelismo.
+  \item Incorporación de conocimiento experto específico.
+\end{itemize}
+
+\textbf{Riesgos:}
+\begin{itemize}[noitemsep]
+  \item Inestabilidad dinámica (oscilaciones, divergencia).
+  \item Dificultad en el entrenamiento conjunto.
+  \item Dependencia alta de datos en dominios biológicos.
+\end{itemize}
+
+\section{Planteamiento Matemático}
+
+\subsection{Modelo Local TRM}
+Cada TRM $i$ con parámetros $\theta_i$ actualiza un estado latente $s_i^{(r)}$ mediante:
+\begin{equation}
+s_i^{(r+1)} = f_{\theta_i}(s_i^{(r)}, m_i^{(r)}, x_i)
+\end{equation}
+
+Donde $x_i$ son observaciones locales y $m_i^{(r)}$ el mensaje recibido. El resultado final del módulo es $o_i = g_{\phi_i}(s_i^{(R)})$.
+
+\subsection{Mensajería Inter-Módulo}
+Definimos $M^{(r)}\in\mathbb{R}^{n\times d_m}$ con emisiones $u_j^{(r)}=\mathrm{emit}(s_j^{(r)})$. Entonces:
+\begin{equation}
+m_i^{(r)} = \mathcal{A}(\{u_j^{(r)}: j\in \mathcal{N}(i)\}; W)
+\end{equation}
+
+Por ejemplo, mediante atención:
+\begin{equation}
+m_i^{(r)} = \sum_{j\in\mathcal{N}(i)} \alpha_{ij}^{(r)}\,\mathrm{proj}(u_j^{(r)}), \quad \alpha_{ij}^{(r)} = \mathrm{softmax}_j(q(s_i^{(r)})\cdot k(u_j^{(r)}))
+\end{equation}
+
+\subsection{Función de Pérdida Global}
+\begin{equation}
+\mathcal{L} = \sum_{i=1}^n \lambda_i \ell_i(o_i, y_i) + \gamma \mathcal{R}(S^{(0:R)})
+\end{equation}
+Donde $\mathcal{R}$ es una regularización espectral o de consistencia entre módulos.
+
+\section{Arquitectura Propuesta}
+
+La topología global se define sobre un grafo dirigido $G=(V,E)$ con $|V|=n$. Los módulos TRM están organizados jerárquicamente y pueden compartir una memoria común. La comunicación se realiza mediante canales compactos y asincrónicos. Un orquestador superior controla iteraciones, pesos y asignación de tareas.
+
+\section{Estrategias de Entrenamiento}
+
+\subsection{Unrolling BPTT}
+Entrenamiento explícito desenrollando $R$ pasos con retropropagación completa.
+
+\subsection{Modelos Implícitos (DEQ)}
+Enfoque de punto fijo $S^* = F_\Theta(S^*, X)$, diferenciado implícitamente. Ahorra memoria y estabiliza la convergencia.
+
+\subsection{Entrenamiento por Bloques}
+Actualización alternada de subconjuntos de módulos; favorece colaboración con expertos.
+
+\subsection{Diseño de Pérdidas}
+Cada TRM tiene pérdida local $\ell_i$, y una pérdida cooperativa de consistencia. Se incluye una pérdida heterocedástica:
+\begin{equation}
+\ell_i = \frac{1}{2} \sum_t \left( \frac{(y_i-\mu_i)^2}{\sigma_i^2} + \log \sigma_i^2 \right)
+\end{equation}
+
+\section{Análisis de Estabilidad}
+
+Sea $F_\Theta$ el mapeo global. Se busca contractividad:
+\begin{equation}
+\exists\rho<1:\ |F(S_1)-F(S_2)|\le\rho|S_1-S_2|
+\end{equation}
+Control mediante normalización espectral y regularización del Jacobiano.
+
+\section{Implementación Práctica}
+
+\begin{verbatim}
+# PyTorch pseudocode for TRM orchestrator
+class TinyTRM(nn.Module):
+    def __init__(...): ...
+    def forward_step(...): ...
+class Orchestrator(nn.Module):
+    def forward(...): ...
+\end{verbatim}
+
+El código implementa un sistema con $n$ TRMs interconectados, iterando mensajes hasta converger.
+
+\section{Evaluación Experimental}
+
+\subsection{Métricas Generales}
+RMSE, NLL, residual $|S^{r+1}-S^r|$, calibración, eficiencia comunicacional, interpretabilidad.
+
+\subsection{Métricas por Dominio}
+\begin{itemize}[noitemsep]
+  \item Mecánica estadística: error en observables, conservación energética.
+  \item Fluidos: error L2 en campos, divergencia nula.
+  \item Genética: AUPR/AUC en off-targets.
+  \item Inmunología: ROC/AUC en binding predictivo.
+\end{itemize}
+
+\section{Datos y Requisitos Computacionales}
+Cada TRM consume datos locales sincronizados. ETL debe garantizar coherencia temporal y normalización. Requiere GPU media (24–48GB) o clúster multi-GPU.
+
+\section{Riesgos, Ética y Colaboración Interdisciplinaria}
+Se definen especialistas y preguntas específicas por área (biología, inmunología, fluidos, ética) para validación experimental y revisión de riesgos.
+
+\section{Plan de Trabajo}
+\begin{itemize}[noitemsep]
+  \item Fase 0: prototipo toy (4 TRMs, PDE 1D).
+  \item Fase 1: solver implícito + regularización.
+  \item Fase 2: piloto de dominio (CFD o bio).
+  \item Fase 3: validación experimental.
+\end{itemize}
+
+\section{Líneas Futuras}
+Estudio de acoplamientos óptimos, multiestabilidad, transferencia entre dominios y explicabilidad física.
+
+\section{Conclusiones y Recomendaciones}
+\begin{enumerate}
+  \item Prototipar orquestador (n=4, d=64).
+  \item Regularizar singular values.
+  \item Añadir cabeza heterocedástica.
+  \item Validar OOD y adversarial.
+  \item Consultar especialistas antes de despliegue biomédico.
+\end{enumerate}
+
+\end{document}
+"""

@@ -1,0 +1,25 @@
+{
+  "feature_cols": [
+    "log_ret_1",
+    "log_ret_5",
+    "momentum_10",
+    "log_ret_accel",
+    "ma_ratio_20",
+    "bb_width",
+    "bb_std_pct",
+    "rsi_14",
+    "atr_pct",
+    "raw_vol_10",
+    "raw_vol_30",
+    "fib_composite",
+    "td_buy_setup",
+    "td_sell_setup"
+  ],
+  "seq_len": 64,
+  "horizon": 12,
+  "hidden": 128,
+  "num_layers": 3,
+  "dropout": 0.2,
+  "best_val_dir_acc": 50.72433043601159,
+  "best_val_loss": 0.0005116909008126848
+}
