@@ -1,0 +1,68 @@
+{
+  "dashboard": {
+    "default_horizons": [1, 3, 5, 10, 20, 30],
+    "default_confidence_levels": [0.68, 0.95],
+    "update_interval_minutes": 5,
+    "auto_refresh": true,
+    "color_scheme": "viridis",
+    "show_probability_layers": true,
+    "show_confidence_gradient": true,
+    "max_history_candles": 200,
+    "chart_style": "line",
+    "multiple_fans_config": {
+      "enabled": false,
+      "scenarios": ["base", "bull", "bear"],
+      "scenario_params": {
+        "base": {
+          "volatility_mult": 1.0,
+          "description": "Standard volatility forecast"
+        },
+        "bull": {
+          "volatility_mult": 0.7,
+          "description": "Optimistic forecast with reduced volatility"
+        },
+        "bear": {
+          "volatility_mult": 1.5,
+          "description": "Pessimistic forecast with increased volatility"
+        }
+      }
+    },
+    "performance": {
+      "cache_enabled": true,
+      "cache_max_age_seconds": 300,
+      "cache_max_size": 10,
+      "async_predictions": true
+    },
+    "data": {
+      "min_rows": 1000,
+      "max_age_minutes": 60,
+      "check_for_gaps": true,
+      "gap_threshold_minutes": 120
+    },
+    "visualization": {
+      "theme": "light",
+      "dpi": 100,
+      "figure_width": 12,
+      "figure_height": 7,
+      "alpha_base": 0.8,
+      "alpha_confidence": 0.15,
+      "linewidth_base": 1.8,
+      "show_grid": true,
+      "grid_alpha": 0.3
+    },
+    "metrics": {
+      "display_columns": [
+        "Horizon",
+        "Target Time",
+        "Predicted Price",
+        "Change ($)",
+        "Change (%)",
+        "95% CI",
+        "Signal"
+      ],
+      "price_format": "${:,.2f}",
+      "change_format": "${:+,.2f}",
+      "pct_format": "{:+.2f}%"
+    }
+  }
+}

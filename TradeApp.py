@@ -88,6 +88,17 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt  # opcional para estilos o utilidades
 
+# Multi-horizon prediction visualization
+try:
+    from dashboard_visualizations_simple import plot_prediction_fan_live_simple
+except ImportError:
+    plot_prediction_fan_live_simple = None
+
+# Feature engineering registry
+try:
+    from core.feature_registry import FEATURE_REGISTRY
+except ImportError:
+    FEATURE_REGISTRY = None
 
 import numpy as np
 import pandas as pd
@@ -278,6 +289,7 @@ class TradingAppExtended:
         self.orderbook_tree = None
         self.orderbook_bids_tree = None
         self.orderbook_asks_tree = None
+        self.status_data_tree = None  # Commented out in UI but methods reference it
 
         # Config vars
         self.sqlite_path = StringVar(value="data_manager/exports/marketdata_base.db")
@@ -295,6 +307,8 @@ class TradingAppExtended:
         self.feature_cols_manual = StringVar(value="")
         # NEW: model path variable (user can specify a checkpoint file)
         self.model_path_var = StringVar(value="")
+        # Feature engineering system selection (v1=39 features, v2=14 clean features)
+        self.feature_system_var = StringVar(value="v2")
 
         # ------------------------------
         # NEW: Status-related settings
@@ -318,6 +332,14 @@ class TradingAppExtended:
         self.pred_ts_var = StringVar(value="N/A")
         self.ticker_var = StringVar(value="N/A")
         self.websocket_status_var = StringVar(value="Disconnected")
+
+        # Multi-horizon dashboard controls
+        self.multi_horizon_mode_var = BooleanVar(value=False)  # Toggle for multi-horizon predictions
+        self.prediction_fan_canvas = None  # FigureCanvasTkAgg for live plot
+        self.prediction_fan_figure = None  # matplotlib Figure
+        self.prediction_fan_ax = None  # matplotlib Axes
+        self.predictions_table = None  # ttk.Treeview for summary table
+        self._last_predictions = {}  # Cache of last predictions dict
 
         # internals
         self.daemon: Optional[TradingDaemon] = None
@@ -1678,28 +1700,77 @@ class TradingAppExtended:
         self.preview_tree = ttk.Treeview(tab)
         self.preview_tree.pack(fill=BOTH, expand=True, padx=6, pady=6)
 
+    def _create_collapsible_frame(self, parent, title, start_collapsed=False):
+        """Create a collapsible frame with a toggle button."""
+        # Container frame
+        container = Frame(parent)
+
+        # Header with toggle button
+        header = Frame(container, relief=RAISED, borderwidth=1)
+        header.pack(fill=X, pady=(0, 4))
+
+        # Toggle state
+        is_collapsed = BooleanVar(value=start_collapsed)
+
+        # Content frame
+        content = Frame(container)
+        if not start_collapsed:
+            content.pack(fill=BOTH, expand=True)
+
+        def toggle():
+            if is_collapsed.get():
+                content.pack_forget()
+                toggle_btn.config(text=f"▶ {title}")
+            else:
+                content.pack(fill=BOTH, expand=True)
+                toggle_btn.config(text=f"▼ {title}")
+            is_collapsed.set(not is_collapsed.get())
+
+        toggle_btn = Button(header, text=f"▼ {title}" if not start_collapsed else f"▶ {title}",
+                           command=toggle, relief=FLAT, anchor=W, font=("Arial", 10, "bold"))
+        toggle_btn.pack(fill=X, padx=2, pady=2)
+
+        return container, content
+
     def _build_train_tab(self):
         tab = Frame(self.nb); self.nb.add(tab, text="Training")
         left = Frame(tab); left.pack(side=LEFT, fill=Y, padx=6, pady=6)
-        Label(left, text="Training config", font=("Arial",11,"bold")).pack(anchor="w")
-        self._add_labeled_entry(left, "seq_len", self.seq_len)
-        self._add_labeled_entry(left, "horizon", self.horizon)
-        self._add_labeled_entry(left, "hidden", self.hidden)
-        self._add_labeled_entry(left, "epochs", self.epochs)
-        self._add_labeled_entry(left, "batch_size", self.batch_size)
-        self._add_labeled_entry(left, "learning rate", self.lr)
-        self._add_labeled_entry(left, "val fraction", self.val_frac)
-        Label(left, text="dtype:").pack(anchor="w", pady=(6,0))
-        OptionMenu(left, self.dtype_choice, "float32", "float64").pack(anchor="w")
-        Label(left, text="feature_cols (comma optional)").pack(anchor="w", pady=(6,0))
-        Entry(left, textvariable=self.feature_cols_manual, width=30).pack(anchor="w")
-        Button(left, text="Save Config", command=self._save_config).pack(anchor="w", pady=(6,2))
-        Button(left, text="Prepare Data (background)", command=self._start_prepare).pack(anchor="w", pady=(2,2))
-        Button(left, text="Train Model (background)", command=self._start_train_model).pack(anchor="w", pady=(2,2))
-        Button(left, text="Prepare + Train (background)", command=self._start_prepare_and_train).pack(anchor="w", pady=(2,2))
-        Button(left, text="Load artifacts model", command=self._load_model_from_artifacts).pack(anchor="w", pady=(6,2))
+
+        # Collapsible training configuration
+        config_container, config_frame = self._create_collapsible_frame(left, "Training Config", start_collapsed=True)
+        config_container.pack(fill=X, pady=(0, 6))
+
+        self._add_labeled_entry(config_frame, "seq_len", self.seq_len)
+        self._add_labeled_entry(config_frame, "horizon", self.horizon)
+        self._add_labeled_entry(config_frame, "hidden", self.hidden)
+        self._add_labeled_entry(config_frame, "epochs", self.epochs)
+        self._add_labeled_entry(config_frame, "batch_size", self.batch_size)
+        self._add_labeled_entry(config_frame, "learning rate", self.lr)
+        self._add_labeled_entry(config_frame, "val fraction", self.val_frac)
+        Label(config_frame, text="dtype:").pack(anchor="w", pady=(6,0))
+        OptionMenu(config_frame, self.dtype_choice, "float32", "float64").pack(anchor="w")
+
+        # Feature Engineering System selector
+        Label(config_frame, text="Feature System:").pack(anchor="w", pady=(6,0))
+        frm_feat = Frame(config_frame)
+        frm_feat.pack(anchor="w")
+        OptionMenu(frm_feat, self.feature_system_var, "v1", "v2").pack(side=LEFT)
+        Label(frm_feat, text="(v1=39 feats, v2=14 clean)", font=("Arial", 8)).pack(side=LEFT, padx=4)
+
+        Label(config_frame, text="feature_cols (comma optional)").pack(anchor="w", pady=(6,0))
+        Entry(config_frame, textvariable=self.feature_cols_manual, width=30).pack(anchor="w")
+
+        # Action buttons - always visible
+        Label(left, text="Actions", font=("Arial",11,"bold")).pack(anchor="w", pady=(6,0))
+        Button(left, text="Save Config", command=self._save_config).pack(anchor="w", pady=(6,2), fill=X)
+        Button(left, text="Prepare Data (background)", command=self._start_prepare).pack(anchor="w", pady=(2,2), fill=X)
+        Button(left, text="Train Model (background)", command=self._start_train_model).pack(anchor="w", pady=(2,2), fill=X)
+        Button(left, text="Prepare + Train (background)", command=self._start_prepare_and_train).pack(anchor="w", pady=(2,2), fill=X)
+
+        Label(left, text="Load Model", font=("Arial",11,"bold")).pack(anchor="w", pady=(12,0))
+        Button(left, text="Load artifacts model", command=self._load_model_from_artifacts).pack(anchor="w", pady=(6,2), fill=X)
         # NEW: load model file (background) - will call daemon.load_model_and_scaler if daemon exists
-        Button(left, text="Load model file (background)", command=self._load_model_file_background).pack(anchor="w", pady=(2,2))
+        Button(left, text="Load model file (background)", command=self._load_model_file_background).pack(anchor="w", pady=(2,2), fill=X)
 
         right = Frame(tab); right.pack(side=LEFT, fill=BOTH, expand=True, padx=6, pady=6)
         Label(right, text="Prepare / Train log & previews", font=("Arial",11,"bold")).pack(anchor="w")
@@ -2080,41 +2151,7 @@ class TradingAppExtended:
         Button(frm_controls, text="Refresh Status", command=self._refresh_status).pack(side=LEFT, padx=6)
         Button(frm_controls, text="Fetch Last Data", command=self._fetch_last_rows_status).pack(side=LEFT, padx=6)
         Button(frm_controls, text="Get Latest Prediction", command=self._get_latest_prediction_thread).pack(side=LEFT, padx=6)
-
-        def _open_ws_panel(self):
-            # Si ya existe una ventana, traerla a front
-            if getattr(self, "_ws_panel_toplevel", None) and getattr(self, "_ws_panel_toplevel", "closed") != "closed":
-                try:
-                    self._ws_panel_toplevel.lift()
-                    return
-                except Exception:
-                    pass
-            top = Toplevel(self.root)
-            top.title("Websocket Panel")
-            top.geometry("900x600")
-            # store reference so we can check it / destroy later
-            self._ws_panel_toplevel = top
-            # When window closes, mark as closed
-            def _on_close():
-                try:
-                    # optional: tidy up widgets inside
-                    self._ws_panel_toplevel = None
-                except Exception:
-                    pass
-                try:
-                    top.destroy()
-                except Exception:
-                    pass
-            top.protocol("WM_DELETE_WINDOW", _on_close)
-            # call your extend function on this new window (it will create frames inside)
-            try:
-                self._extend_status_tab_ui(top)
-            except Exception:
-                logging.getLogger(__name__).exception("Failed to create ws panel UI in Toplevel")
-
-        # antes: command=lambda: self._open_ws_panel(None)
-        btn_ws_panel = Button(frm_controls, text="Open WS Panel", command=_open_ws_panel)
-        btn_ws_panel.pack(side=LEFT, padx=6)
+        Button(frm_controls, text="Open WS Panel", command=self._open_ws_panel).pack(side=LEFT, padx=6)
 
         # Right side: small summary card for latest data / prediction
         frm_summary = Frame(tab, relief=RIDGE, bd=1)
@@ -2136,59 +2173,124 @@ class TradingAppExtended:
         Label(frm_summary, text="Pred timestamp:").grid(row=3, column=2, sticky=W, padx=12, pady=2)
         Label(frm_summary, textvariable=self.pred_ts_var).grid(row=3, column=3, sticky=W, padx=4, pady=2)
 
-        # Extra websocket controls & visual options
-        frm_ws_ctrl = Frame(tab)
-        frm_ws_ctrl.pack(fill=X, padx=6, pady=(2,6))
+        # Extra websocket controls & visual options - Comentadas por redundancia con el WS Panel
+        # frm_ws_ctrl = Frame(tab)
+        # frm_ws_ctrl.pack(fill=X, padx=6, pady=(2,6))
 
-        Label(frm_ws_ctrl, text="Verbose:").pack(side=LEFT, padx=(0,4))
-        OptionMenu(frm_ws_ctrl, self.ws_verbose_var, 0,1,2).pack(side=LEFT)
-        Label(frm_ws_ctrl, text="Big trade threshold:").pack(side=LEFT, padx=(12,4))
-        Entry(frm_ws_ctrl, textvariable=self.big_trade_threshold_var, width=10).pack(side=LEFT)
-        Checkbutton(frm_ws_ctrl, text="Show Orderbook", variable=self.show_orderbook_var).pack(side=LEFT, padx=8)
-        Checkbutton(frm_ws_ctrl, text="Show Trades", variable=self.show_trades_var).pack(side=LEFT, padx=4)
+        # Label(frm_ws_ctrl, text="Verbose:").pack(side=LEFT, padx=(0,4))
+        # OptionMenu(frm_ws_ctrl, self.ws_verbose_var, 0,1,2).pack(side=LEFT)
+        # Label(frm_ws_ctrl, text="Big trade threshold:").pack(side=LEFT, padx=(12,4))
+        # Entry(frm_ws_ctrl, textvariable=self.big_trade_threshold_var, width=10).pack(side=LEFT)
+        # Checkbutton(frm_ws_ctrl, text="Show Orderbook", variable=self.show_orderbook_var).pack(side=LEFT, padx=8)
+        # Checkbutton(frm_ws_ctrl, text="Show Trades", variable=self.show_trades_var).pack(side=LEFT, padx=4)
 
         # Bottom: tree showing last data rows (existing)
-        self.status_data_tree = ttk.Treeview(tab)
-        self.status_data_tree.pack(fill=BOTH, expand=False, padx=6, pady=6, ipady=20)
+        # self.status_data_tree = ttk.Treeview(tab)
+        # self.status_data_tree.pack(fill=BOTH, expand=False, padx=6, pady=6, ipady=20)
 
         # Websocket displays: trades / big trades / orderbook
-        frm_ws_display = Frame(tab)
-        frm_ws_display.pack(fill=BOTH, expand=True, padx=6, pady=4)
+        # frm_ws_display = Frame(tab)
+        # frm_ws_display.pack(fill=BOTH, expand=True, padx=6, pady=4)
 
         # Left: trades + big trades
-        frm_trades = Frame(frm_ws_display, relief=RIDGE, bd=1)
-        frm_trades.pack(side=LEFT, fill=BOTH, expand=True, padx=4, pady=4)
-        Label(frm_trades, text="Recent Trades").pack(anchor="w")
-        self.trades_tree = ttk.Treeview(frm_trades, columns=("ts","side","price","qty"), show="headings", height=8)
-        for c, t in [("ts","TS"),("side","Side"),("price","Price"),("qty","Qty")]:
-            self.trades_tree.heading(c, text=t)
-            self.trades_tree.column(c, width=80, anchor=W)
-        self.trades_tree.pack(fill=BOTH, expand=True)
+        # frm_trades = Frame(frm_ws_display, relief=RIDGE, bd=1)
+        # frm_trades.pack(side=LEFT, fill=BOTH, expand=True, padx=4, pady=4)
+        # Label(frm_trades, text="Recent Trades").pack(anchor="w")
+        # self.trades_tree = ttk.Treeview(frm_trades, columns=("ts","side","price","qty"), show="headings", height=8)
+        # for c, t in [("ts","TS"),("side","Side"),("price","Price"),("qty","Qty")]:
+        #     self.trades_tree.heading(c, text=t)
+        #     self.trades_tree.column(c, width=80, anchor=W)
+        # self.trades_tree.pack(fill=BOTH, expand=True)
 
-        Label(frm_trades, text="Big Trades").pack(anchor="w", pady=(6,0))
-        self.big_trades_tree = ttk.Treeview(frm_trades, columns=("ts","side","price","qty"), show="headings", height=4)
-        for c, t in [("ts","TS"),("side","Side"),("price","Price"),("qty","Qty")]:
-            self.big_trades_tree.heading(c, text=t)
-            self.big_trades_tree.column(c, width=80, anchor=W)
-        self.big_trades_tree.pack(fill=X, expand=False)
+        # Label(frm_trades, text="Big Trades").pack(anchor="w", pady=(6,0))
+        # self.big_trades_tree = ttk.Treeview(frm_trades, columns=("ts","side","price","qty"), show="headings", height=4)
+        # for c, t in [("ts","TS"),("side","Side"),("price","Price"),("qty","Qty")]:
+        #     self.big_trades_tree.heading(c, text=t)
+        #     self.big_trades_tree.column(c, width=80, anchor=W)
+        # self.big_trades_tree.pack(fill=X, expand=False)
 
         # Right: orderbook. Falta cambiar callers orderbook_tree por orderbook_asks_tree y orderbook_bids_tree segun corresonda
-        frm_ob = Frame(frm_ws_display, relief=RIDGE, bd=1)
-        frm_ob.pack(side=LEFT, fill=BOTH, expand=True, padx=4, pady=4)
+        # frm_ob = Frame(frm_ws_display, relief=RIDGE, bd=1)
+        # frm_ob.pack(side=LEFT, fill=BOTH, expand=True, padx=4, pady=4)
 
-        Label(frm_ob, text="Orderbook - Asks").pack(anchor="w")
-        self.orderbook_asks_tree = ttk.Treeview(frm_ob, columns=("price","qty"), show="headings", height=10)
-        for c, t in [("price","Price"),("qty","Qty")]:
-            self.orderbook_asks_tree.heading(c, text=t)
-            self.orderbook_asks_tree.column(c, width=100, anchor=W)
-        self.orderbook_asks_tree.pack(fill=BOTH, expand=True)
+        # Label(frm_ob, text="Orderbook - Asks").pack(anchor="w")
+        # self.orderbook_asks_tree = ttk.Treeview(frm_ob, columns=("price","qty"), show="headings", height=10)
+        # for c, t in [("price","Price"),("qty","Qty")]:
+        #     self.orderbook_asks_tree.heading(c, text=t)
+        #     self.orderbook_asks_tree.column(c, width=100, anchor=W)
+        # self.orderbook_asks_tree.pack(fill=BOTH, expand=True)
 
-        Label(frm_ob, text="Orderbook - Bids").pack(anchor="w")
-        self.orderbook_bids_tree = ttk.Treeview(frm_ob, columns=("price","qty"), show="headings", height=10)
-        for c, t in [("price","Price"),("qty","Qty")]:
-            self.orderbook_bids_tree.heading(c, text=t)
-            self.orderbook_bids_tree.column(c, width=100, anchor=W)
-        self.orderbook_bids_tree.pack(fill=BOTH, expand=True)
+        # Label(frm_ob, text="Orderbook - Bids").pack(anchor="w")
+        # self.orderbook_bids_tree = ttk.Treeview(frm_ob, columns=("price","qty"), show="headings", height=10)
+        # for c, t in [("price","Price"),("qty","Qty")]:
+        #     self.orderbook_bids_tree.heading(c, text=t)
+        #     self.orderbook_bids_tree.column(c, width=100, anchor=W)
+        # self.orderbook_bids_tree.pack(fill=BOTH, expand=True)
+
+        # ========== MULTI-HORIZON PREDICTION DASHBOARD ==========
+
+        # Section header
+        Label(tab, text="Live Multi-Horizon Predictions",
+              font=("Arial", 12, "bold")).pack(anchor="w", padx=6, pady=(15,4))
+
+        # Control buttons
+        frm_pred_ctrl = Frame(tab)
+        frm_pred_ctrl.pack(fill=X, padx=6, pady=4)
+
+        self.multi_horizon_enabled_var = BooleanVar(value=False)
+        chk_mh = Checkbutton(frm_pred_ctrl, text="Enable Multi-Horizon Mode",
+                             variable=self.multi_horizon_enabled_var,
+                             command=self._toggle_multi_horizon_mode)
+        chk_mh.pack(side=LEFT, padx=4)
+
+        Button(frm_pred_ctrl, text="Refresh Predictions",
+               command=self._manual_refresh_predictions).pack(side=LEFT, padx=4)
+
+        self.last_pred_update_var = StringVar(value="Never")
+        Label(frm_pred_ctrl, text="Last update:").pack(side=LEFT, padx=(10,2))
+        Label(frm_pred_ctrl, textvariable=self.last_pred_update_var).pack(side=LEFT)
+
+        # Prediction fan canvas (matplotlib)
+        frm_canvas = Frame(tab, relief=SUNKEN, borderwidth=1)
+        frm_canvas.pack(fill=BOTH, expand=True, padx=6, pady=6)
+
+        self.pred_fan_fig = Figure(figsize=(14, 5), dpi=100, facecolor='#f0f0f0')
+        self.pred_fan_ax = self.pred_fan_fig.add_subplot(111)
+        self.pred_fan_canvas = FigureCanvasTkAgg(self.pred_fan_fig, master=frm_canvas)
+        self.pred_fan_canvas.get_tk_widget().pack(fill=BOTH, expand=True)
+
+        # Initial placeholder
+        self.pred_fan_ax.text(0.5, 0.5,
+                             "Enable Multi-Horizon Mode and start daemon to see predictions",
+                             ha="center", va="center", fontsize=11, color="gray")
+        self.pred_fan_ax.set_xlim(0, 1)
+        self.pred_fan_ax.set_ylim(0, 1)
+        self.pred_fan_ax.axis("off")
+        self.pred_fan_canvas.draw()
+
+        # Predictions summary table
+        frm_pred_table = Frame(tab)
+        frm_pred_table.pack(fill=X, padx=6, pady=(0,6))
+
+        Label(frm_pred_table, text="Predictions Summary",
+              font=("Arial", 10, "bold")).pack(anchor="w", pady=2)
+
+        cols = ("Horizon", "Target Time", "Predicted Price", "Change ($)", "Change (%)", "95% CI", "Signal")
+        self.pred_summary_tree = ttk.Treeview(frm_pred_table, columns=cols, height=7, show="headings")
+
+        for col in cols:
+            self.pred_summary_tree.heading(col, text=col)
+            width = 120 if col != "95% CI" else 180
+            self.pred_summary_tree.column(col, width=width, anchor=CENTER if col == "Signal" else W)
+
+        self.pred_summary_tree.pack(fill=X)
+
+        # Scrollbar for table
+        sb = ttk.Scrollbar(frm_pred_table, orient=VERTICAL, command=self.pred_summary_tree.yview)
+        sb.pack(side=RIGHT, fill=Y)
+        self.pred_summary_tree.configure(yscrollcommand=sb.set)
+
+        # ========== END MULTI-HORIZON DASHBOARD ==========
 
         # ensure queue processing is active (safe to call multiple times)
         try:
@@ -2446,6 +2548,42 @@ class TradingAppExtended:
         except Exception as e:
             self._enqueue_log(f"Refresh status failed: {e}")
 
+    def _open_ws_panel(self):
+        """Open WebSocket panel in a separate window."""
+        # Si ya existe una ventana, traerla a front
+        if getattr(self, "_ws_panel_toplevel", None) and getattr(self, "_ws_panel_toplevel", "closed") != "closed":
+            try:
+                self._ws_panel_toplevel.lift()
+                return
+            except Exception:
+                pass
+
+        top = Toplevel(self.root)
+        top.title("Websocket Panel")
+        top.geometry("900x600")
+
+        # Store reference so we can check it / destroy later
+        self._ws_panel_toplevel = top
+
+        # When window closes, mark as closed
+        def _on_close():
+            try:
+                self._ws_panel_toplevel = None
+            except Exception:
+                pass
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+        top.protocol("WM_DELETE_WINDOW", _on_close)
+
+        # Call extend function on this new window (it will create frames inside)
+        try:
+            self._extend_status_tab_ui(top)
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to create ws panel UI in Toplevel")
+
     def _fetch_last_rows_status(self, limit: int = 50):
         """Load last rows for the selected symbol/timeframe and populate the status_data_tree.
         Runs in background to avoid UI freeze."""
@@ -2526,12 +2664,16 @@ class TradingAppExtended:
         threading.Thread(target=worker, daemon=True).start()
 
     def _clear_status_data_tree(self):
+        if self.status_data_tree is None:
+            return  # Widget not created (commented out in UI)
         for iid in self.status_data_tree.get_children():
             self.status_data_tree.delete(iid)
         self.status_data_tree["columns"] = ()
 
     def _populate_status_data_tree(self, df: pd.DataFrame):
         try:
+            if self.status_data_tree is None:
+                return  # Widget not created (commented out in UI)
             # Clear existing
             for iid in self.status_data_tree.get_children():
                 self.status_data_tree.delete(iid)
@@ -2612,7 +2754,18 @@ class TradingAppExtended:
                 high = df["high"].astype(float).values if "high" in df.columns else None
                 low = df["low"].astype(float).values if "low" in df.columns else None
                 vol = df["volume"].astype(float).values if "volume" in df.columns else None
-                feats = fibo.add_technical_features(close, high=high, low=low, volume=vol)
+
+                # Use feature registry system (v1 or v2)
+                if FEATURE_REGISTRY is not None:
+                    feats = FEATURE_REGISTRY.compute_features(
+                        close, high=high, low=low, volume=vol,
+                        system_name=self.feature_system_var.get(),
+                        dropna_after=False  # Let TradeApp handle dropna later
+                    )
+                else:
+                    # Fallback to v1 if registry not available
+                    feats = fibo.add_technical_features(close, high=high, low=low, volume=vol, dropna_after=False)
+
                 if not isinstance(feats, pd.DataFrame):
                     feats = pd.DataFrame(np.asarray(feats))
                 # attach columns from df if missing
@@ -2953,7 +3106,18 @@ class TradingAppExtended:
                 high = df["high"].astype(float).values
                 low = df["low"].astype(float).values
                 vol = df["volume"].astype(float).values if "volume" in df.columns else None
-                feats = fibo.add_technical_features(close, high=high, low=low, volume=vol)
+
+                # Use feature registry system (v1 or v2)
+                if FEATURE_REGISTRY is not None:
+                    feats = FEATURE_REGISTRY.compute_features(
+                        close, high=high, low=low, volume=vol,
+                        system_name=self.feature_system_var.get(),
+                        dropna_after=False  # Let TradeApp handle dropna later (line 3098)
+                    )
+                else:
+                    # Fallback to v1 if registry not available
+                    feats = fibo.add_technical_features(close, high=high, low=low, volume=vol, dropna_after=False)
+
                 if not isinstance(feats, pd.DataFrame):
                     # try to coerce
                     arr = np.asarray(feats)
@@ -3403,7 +3567,18 @@ class TradingAppExtended:
             high = df["high"].astype(float).values
             low = df["low"].astype(float).values
             vol = df["volume"].astype(float).values if "volume" in df.columns else None
-            feats = fibo.add_technical_features(close, high=high, low=low, volume=vol)
+
+            # Use feature registry system (v1 or v2)
+            if FEATURE_REGISTRY is not None:
+                feats = FEATURE_REGISTRY.compute_features(
+                    close, high=high, low=low, volume=vol,
+                    system_name=self.feature_system_var.get(),
+                    dropna_after=False  # Let TradeApp handle dropna later (line 3538)
+                )
+            else:
+                # Fallback to v1 if registry not available
+                feats = fibo.add_technical_features(close, high=high, low=low, volume=vol, dropna_after=False)
+
             for col in ("timestamp","close"):
                 if col in df.columns and col not in feats.columns:
                     feats[col] = df[col].values
@@ -3504,7 +3679,7 @@ class TradingAppExtended:
                 timeframe=self.timeframe.get(),
                 model_path=model_path_arg,   # None or explicit path
                 scaler_path=None,
-                meta_path=None,
+                meta_path="artifacts/meta.json",  # Explicitly load metadata
                 ledger_path=None,
                 exchange_id=None,
                 api_key=None,
@@ -3516,6 +3691,21 @@ class TradingAppExtended:
             )
             self.daemon.start_loop()
             self.btn_start.config(state=DISABLED); self.btn_stop.config(state=NORMAL)
+
+            # Ensure metadata is loaded explicitly (even if meta_path was passed)
+            meta_path = Path("artifacts/meta.json")
+            if meta_path.exists():
+                try:
+                    import json
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    if self.daemon:
+                        self.daemon.model_meta = meta
+                        feat_count = len(meta.get('feature_cols', []))
+                        self._enqueue_log(f"Loaded metadata: {feat_count} features configured")
+                except Exception as e:
+                    self._enqueue_log(f"Warning: Could not load metadata: {e}")
+
             self._enqueue_log("Daemon started.")
 
             # If model_path was provided, load it in background to avoid UI freeze
@@ -3547,6 +3737,173 @@ class TradingAppExtended:
             self.daemon = None
             self.btn_start.config(state=NORMAL); self.btn_stop.config(state=DISABLED)
             self._enqueue_log("Daemon stopped.")
+
+    # --------------------------
+    # Multi-Horizon Predictions (NEW)
+    # --------------------------
+    def _toggle_multi_horizon_mode(self):
+        """Toggle multi-horizon mode in daemon."""
+        enabled = self.multi_horizon_enabled_var.get()
+
+        if self.daemon:
+            self.daemon.multi_horizon_mode = enabled
+            self._enqueue_log(f"Multi-horizon mode: {'ON' if enabled else 'OFF'}")
+
+            if enabled:
+                # Start predictions queue polling
+                self.root.after(100, self._poll_predictions_queue)
+        else:
+            self._enqueue_log("Start daemon first to enable multi-horizon mode")
+            self.multi_horizon_enabled_var.set(False)
+
+    def _manual_refresh_predictions(self):
+        """Manually trigger prediction update (useful for debugging)."""
+        if self.daemon and self.daemon.multi_horizon_mode:
+            def _bg():
+                preds = self.daemon.iteration_once_multi_horizon()
+                if preds:
+                    self._enqueue_log(f"Manual refresh: got {len(preds)} horizons")
+
+            threading.Thread(target=_bg, daemon=True).start()
+        else:
+            self._enqueue_log("Enable multi-horizon mode first")
+
+    def _poll_predictions_queue(self):
+        """
+        Poll daemon's predictions_queue and update UI.
+        Called periodically when multi-horizon mode is enabled.
+        """
+        if not self.multi_horizon_enabled_var.get():
+            return  # Stopped
+
+        if self.daemon is None or not hasattr(self.daemon, "predictions_queue"):
+            # Daemon not running, retry later
+            self.root.after(5000, self._poll_predictions_queue)
+            return
+
+        try:
+            import queue
+            # Try to get predictions (non-blocking)
+            predictions = self.daemon.predictions_queue.get_nowait()
+
+            if predictions:
+                # Get historical data for plot
+                if self.daemon:
+                    df_history = self.daemon._load_recent_rows(limit=200)
+                else:
+                    df_history = self.df_loaded.tail(200) if self.df_loaded is not None else None
+
+                # Update display
+                self._update_prediction_fan_display(predictions, df_history)
+
+                # Update timestamp
+                from datetime import datetime
+                self.last_pred_update_var.set(datetime.now().strftime("%H:%M:%S"))
+
+        except queue.Empty:
+            pass  # No new predictions
+        except Exception as e:
+            self._enqueue_log(f"Predictions poll error: {e}")
+
+        # Schedule next poll
+        interval_ms = int(self.refresh_interval_var.get() * 1000) if hasattr(self, "refresh_interval_var") else 5000
+        self.root.after(interval_ms, self._poll_predictions_queue)
+
+    def _update_prediction_fan_display(self, predictions: Dict[int, Dict], df_history: pd.DataFrame):
+        """
+        Update prediction fan canvas and summary table.
+
+        Args:
+            predictions: {horizon: {price, log_return, volatility, ci_lower_95, ci_upper_95, ...}}
+            df_history: Recent OHLCV data for historical context
+        """
+        try:
+            # Clear axis
+            ax = self.pred_fan_ax
+            ax.clear()
+
+            if df_history is None or df_history.empty:
+                ax.text(0.5, 0.5, "No historical data available", ha="center", va="center")
+                self.pred_fan_canvas.draw()
+                return
+
+            # Import visualization function
+            try:
+                from dashboard_visualizations_simple import plot_prediction_fan_live_simple
+            except ImportError:
+                ax.text(0.5, 0.5, "dashboard_visualizations_simple module not found",
+                       ha="center", va="center", color="red")
+                self.pred_fan_canvas.draw()
+                return
+
+            # Plot
+            plot_prediction_fan_live_simple(
+                ax=ax,
+                df_history=df_history,
+                predictions_dict=predictions,
+                show_confidence=True,
+                colormap="viridis"
+            )
+
+            self.pred_fan_canvas.draw()
+
+            # Update summary table
+            self._update_prediction_summary_table(predictions)
+
+        except Exception as e:
+            self._enqueue_log(f"Failed to update prediction display: {e}")
+            import traceback
+            self._enqueue_log(traceback.format_exc(), level=logging.DEBUG)
+
+    def _update_prediction_summary_table(self, predictions: Dict[int, Dict]):
+        """Update predictions summary table with latest data."""
+        try:
+            from datetime import datetime, timedelta
+
+            # Clear existing rows
+            for item in self.pred_summary_tree.get_children():
+                self.pred_summary_tree.delete(item)
+
+            # Populate with predictions
+            for h in sorted(predictions.keys()):
+                pred = predictions[h]
+
+                # Calculate target time (assuming 1h timeframe)
+                target_time = (datetime.now() + timedelta(hours=h)).strftime("%m-%d %H:%M")
+
+                price = f"${pred.get('price', 0):.2f}"
+                change_usd = pred.get('change_usd', 0)
+                change_pct = pred.get('change_pct', 0)
+                ci = f"[${pred.get('ci_lower_95', 0):.0f}, ${pred.get('ci_upper_95', 0):.0f}]"
+
+                # Signal
+                if change_pct > 0.1:
+                    signal = "UP"
+                elif change_pct < -0.1:
+                    signal = "DN"
+                else:
+                    signal = "FLAT"
+
+                # Color coding
+                tag = "positive" if change_pct > 0 else "negative" if change_pct < 0 else "neutral"
+
+                self.pred_summary_tree.insert("", "end", values=(
+                    f"{h}h",
+                    target_time,
+                    price,
+                    f"${change_usd:+.2f}",
+                    f"{change_pct:+.2f}%",
+                    ci,
+                    signal
+                ), tags=(tag,))
+
+            # Configure tag colors
+            self.pred_summary_tree.tag_configure("positive", foreground="darkgreen")
+            self.pred_summary_tree.tag_configure("negative", foreground="darkred")
+            self.pred_summary_tree.tag_configure("neutral", foreground="gray")
+
+        except Exception as e:
+            self._enqueue_log(f"Failed to update prediction table: {e}")
 
     # --------------------------
     # Background model load from model_path UI (NEW)
@@ -3591,6 +3948,14 @@ class TradingAppExtended:
 def main():
     root = Tk()
     app = TradingAppExtended(root)
+
+    # Apply enhancements (themes + feature inspection in audit tab)
+    try:
+        from TradeApp_enhancements import apply_enhancements
+        apply_enhancements(app)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not apply enhancements: {e}")
+
     root.mainloop()
 
 if __name__ == "__main__":

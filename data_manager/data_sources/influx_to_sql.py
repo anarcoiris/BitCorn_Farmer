@@ -52,7 +52,7 @@ wa.WriteApi.__del__ = safe_del
 # ----------------------
 DEFAULT_INFLUX_CONFIG = {
     "url": "http://localhost:8086",
-    "token": "X5AtE8ugteP26xo0lkNco0AXklsmNcTs9q49B4eWXl4x-3o74wo6_FJIyTjo5wWNXoc6gYXluFzblcKDGYKXeQ==",
+    "token": "YiiARrYB9nYSTBoXrstUVGjv2I5EoUDwagXVxG4_n-7fJKh72lw3o8P_R9XfTtDRSBF3kdcYbroi9ilIeeNyeA==",
     "org": "BreOrganization",
     "bucket": "prices"
 }

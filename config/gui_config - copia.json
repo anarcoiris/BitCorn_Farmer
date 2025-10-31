@@ -1,0 +1,15 @@
+{
+  "sqlite_path": "C:/Users/aladin/Documents/BitCorn_Farmer/data_manager/exports/Binance_BTCUSDT_1h.db",
+  "table": "ohlcv",
+  "symbol": "BTCUSDT",
+  "timeframe": "1h",
+  "seq_len": 32,
+  "horizon": 4,
+  "hidden": 92,
+  "epochs": 10,
+  "batch_size": 32,
+  "lr": 0.001,
+  "val_frac": 0.2,
+  "dtype": "float32",
+  "feature_cols_manual": ""
+}

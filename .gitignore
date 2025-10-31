@@ -20,6 +20,17 @@ data_manager/exports/*.db
 data_manager/exports/*.csv
 data_manager/old_models
 
+# Generated outputs (plots and predictions)
+outputs/plots/*.png
+outputs/plots/*.jpg
+outputs/plots/*.pdf
+outputs/predictions/*.csv
+outputs/predictions/*/
+
+# Except example outputs
+!outputs/plots/example_*.png
+!outputs/predictions/example_*.csv
+
 # Logs
 logs/*.txt
 logs/*.log

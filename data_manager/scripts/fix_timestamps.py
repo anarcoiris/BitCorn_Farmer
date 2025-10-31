@@ -7,7 +7,7 @@ Detecta y corrige timestamps en CSV que están en unidades equivocadas
 desde epoch (13 dígitos) y actualiza la columna de fecha legible.
 
 Uso:
-    python fix_timestamps.py input.csv output_fixed.csv
+    python fix_timestamps.py ../exports/Binance_BTCUSDT_1h_broken.csv Binance_BTCUSDT_1h.csv
 Opciones:
     --ts-col INDEX    (índice 0 por defecto)
     --date-col INDEX  (índice 1 por defecto)

@@ -326,12 +326,12 @@ def predict_multi_horizon_jump(
             price_pred = price_current * np.exp(pred_log_ret)
 
             # Confidence intervals
+            # 0.76 sigma (~55% confidence)
+            upper_1std = price_current * np.exp(pred_log_ret + 0.76 * pred_vol)
+            lower_1std = price_current * np.exp(pred_log_ret - 0.76 * pred_vol)
             # 1 sigma (~68% confidence)
-            upper_1std = price_current * np.exp(pred_log_ret + 1 * pred_vol)
-            lower_1std = price_current * np.exp(pred_log_ret - 1 * pred_vol)
-            # 2 sigma (~95% confidence)
-            upper_2std = price_current * np.exp(pred_log_ret + 2 * pred_vol)
-            lower_2std = price_current * np.exp(pred_log_ret - 2 * pred_vol)
+            upper_2std = price_current * np.exp(pred_log_ret + 1 * pred_vol)
+            lower_2std = price_current * np.exp(pred_log_ret - 1 * pred_vol)
 
             # Get timestamp
             if "timestamp" in df.columns:
@@ -602,7 +602,7 @@ def plot_predictions(
     if show_confidence:
         # Handle potential length mismatch from filtering
         if len(x_pred) == len(predictions_df):
-            # 2-sigma (95% CI)
+            # 1-sigma (68% CI)
             if "upper_bound_2std" in predictions_df.columns:
                 ax.fill_between(
                     x_pred,
@@ -610,9 +610,9 @@ def plot_predictions(
                     predictions_df["upper_bound_2std"],
                     alpha=0.15,
                     color="blue",
-                    label="95% CI (±2σ)"
+                    label="68% CI (±1σ)"
                 )
-            # 1-sigma (68% CI)
+            # 0.76-sigma (55% CI)
             if "upper_bound_1std" in predictions_df.columns:
                 ax.fill_between(
                     x_pred,
@@ -620,7 +620,7 @@ def plot_predictions(
                     predictions_df["upper_bound_1std"],
                     alpha=0.25,
                     color="blue",
-                    label="68% CI (±1σ)"
+                    label="55% CI (±0.76σ)"
                 )
 
     # Formatting

@@ -26,7 +26,10 @@ Usage:
     py -3.10 csv_to_sqlite_upserter.py --csv data_manager\exports\binance_btcusdt\Binance_BTCUSDT_2020_minute.csv data_manager\exports\binance_btcusdt\Binance_BTCUSDT_2021_minute.csv data_manager\exports\binance_btcusdt\Binance_BTCUSDT_2022_minute.csv data_manager\exports\binance_btcusdt\Binance_BTCUSDT_2023_minute.csv data_manager\exports\binance_btcusdt\Binance_BTCUSDT_2024_minute.csv data_manager\exports\binance_btcusdt\Binance_BTCUSDT_2025_minute.csv --db data_manager\exports\Binance_BTCUSDT_1m.db --timeframe 1m --normalize-symbol
 
     # Normalize symbols (BTC/USDT → BTCUSDT)
-    python csv_to_sqlite_upserter.py --csv data.csv --db marketdata.db --normalize-symbol
+    python csv_to_sqlite_upserter.py --csv data.csv --db marketdata.db 
+    python csv_to_sqlite_upserter.py --csv data_manager\exports\Kucoin_XMRUSDT_1h.csv --db data_manager\exports\Kucoin_XMRUSDT_1h.db --normalize-symbol --timeframe 1h
+    python csv_to_sqlite_upserter.py --csv data_manager\exports\Binance_BTCUSDT_1h.csv --db data_manager\exports\Binance_BTCUSDT_1h.db --normalize-symbol --timeframe 1h
+ 
 
 Python API:
     from csv_to_sqlite_upserter import upsert_csv_to_sqlite

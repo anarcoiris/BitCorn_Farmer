@@ -23,6 +23,7 @@ import time
 import logging
 import json
 import math
+import queue
 from pathlib import Path
 from typing import Optional, List, Any, Dict, Tuple
 import sqlite3
@@ -54,6 +55,19 @@ try:
     import fiboevo as fibo
 except Exception:
     fibo = None
+
+# Multi-horizon prediction support (for dashboard integration)
+try:
+    from multi_horizon_fan_inference import predict_single_point_multi_horizon
+except ImportError:
+    predict_single_point_multi_horizon = None
+
+# Feature engineering registry
+try:
+    from core.feature_registry import FEATURE_REGISTRY
+except ImportError:
+    FEATURE_REGISTRY = None
+
 # import config_manager
 try:
     from config_manager import load_config, config_info
@@ -214,6 +228,19 @@ class TradingDaemon:
 
         # Ensure ledger dir exists
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Multi-horizon predictions queue (for GUI consumption)
+        self.predictions_queue = _queue_mod.Queue(maxsize=10)
+
+        # Control flag: enable/disable multi-horizon mode
+        self.multi_horizon_mode = False  # Can be toggled from GUI
+        self.multi_horizon_horizons = [1, 3, 5, 10, 15, 20, 30]  # Default horizons
+
+        # Feature engineering system selection (v1=39 features, v2=14 clean)
+        self.feature_system = "v2"  # Can be changed by GUI
+
+        # Torch device for inference
+        self.device = None  # Will be set in load_model_and_scaler
 
         self._enqueue_log(f"TradingDaemon initialized (symbol={self.symbol}, tf={self.timeframe}, paper={self.paper}, ledger={self.ledger_path}).")
 
@@ -381,11 +408,32 @@ class TradingDaemon:
         self._enqueue_log("Daemon stopped.")
 
     def run_loop(self):
-        """Main loop: repeatedly call iteration_once with resilient sleep/backoff."""
+        """Main loop: inference + trading (with multi-horizon support)."""
         backoff = 1.0
         while not self._stop_event.is_set():
             try:
-                self.iteration_once()
+                if self.multi_horizon_mode:
+                    # Multi-horizon mode: generate fan predictions
+                    predictions = self.iteration_once_multi_horizon()
+
+                    # Extract native horizon for trading (optional)
+                    native_h = self.model_meta.get("horizon", 10)
+                    if native_h in predictions:
+                        pred_data = predictions[native_h]
+                        pred_log_ret = pred_data.get("log_return", 0)
+
+                        # Trading decision (only on native horizon)
+                        if self._should_trade(pred_log_ret):
+                            # Note: For now, we skip trading in multi-horizon mode
+                            # (or you can implement full trading logic here)
+                            self._enqueue_log(
+                                f"[Multi-horizon] Trading signal: {pred_log_ret:.4f} (not executing in MH mode)",
+                                level=logging.INFO
+                            )
+                else:
+                    # Standard single-horizon mode
+                    self.iteration_once()
+
                 backoff = 1.0  # reset on success
             except Exception as e:
                 self._enqueue_log(f"Iteration failed: {e}")
@@ -577,9 +625,11 @@ class TradingDaemon:
                 device = torch.device("cpu")
                 model.to(device)
                 model.eval()
+                self.device = device  # Store device for multi-horizon inference
                 self._enqueue_log("Model prepared on CPU.")
             except Exception:
                 self._enqueue_log("Warning: failed to move model to CPU (torch/device issue).")
+                self.device = torch.device("cpu") if torch is not None else None
 
             # Load scaler if present
             scaler = None
@@ -597,6 +647,8 @@ class TradingDaemon:
             # assign only after full successful load
             self.model = model
             self.model_meta = meta or {}
+            # Reset warning flag now that metadata is loaded
+            self._logged_no_features = False
 
             # Load scaler with feature validation (prefer new API)
             if sp.exists():
@@ -650,7 +702,18 @@ class TradingDaemon:
             high = df["high"].astype(float).values if "high" in df.columns else None
             low = df["low"].astype(float).values if "low" in df.columns else None
             vol = df["volume"].astype(float).values if "volume" in df.columns else None
-            feats = fibo.add_technical_features(close, high=high, low=low, volume=vol)
+
+            # Use feature registry system (v1 or v2)
+            if FEATURE_REGISTRY is not None:
+                feats = FEATURE_REGISTRY.compute_features(
+                    close, high=high, low=low, volume=vol,
+                    system_name=self.feature_system,
+                    dropna_after=False  # Let daemon handle dropna later (line 720)
+                )
+            else:
+                # Fallback to v1 if registry not available
+                feats = fibo.add_technical_features(close, high=high, low=low, volume=vol, dropna_after=False)
+
             if not isinstance(feats, pd.DataFrame):
                 feats = pd.DataFrame(np.asarray(feats))
             # attach relevant columns if missing
@@ -794,6 +857,114 @@ class TradingDaemon:
         except Exception as e:
             self._enqueue_log(f"Action failed: {e}")
             self.logger.exception("Action exception")
+
+    def iteration_once_multi_horizon(self) -> Dict[int, Dict]:
+        """
+        Extended version of iteration_once() that generates multi-horizon predictions.
+
+        Same data loading and feature engineering as iteration_once(),
+        but uses multi_horizon_fan_inference for predictions.
+
+        Returns:
+            Dict of predictions keyed by horizon (or empty dict if error)
+        """
+        try:
+            # 1. Load recent data
+            df = self._load_recent_rows(limit=1000)
+            if df is None or df.empty:
+                self._enqueue_log("No data available for multi-horizon inference", level=logging.DEBUG)
+                return {}
+
+            # 2. Compute features
+            if fibo is None or not hasattr(fibo, "add_technical_features"):
+                self._enqueue_log("fiboevo not available for multi-horizon features", level=logging.DEBUG)
+                return {}
+
+            try:
+                close = df["close"].astype(float).values
+                high = df["high"].astype(float).values if "high" in df.columns else None
+                low = df["low"].astype(float).values if "low" in df.columns else None
+                vol = df["volume"].astype(float).values if "volume" in df.columns else None
+
+                # Use feature registry system (v1 or v2)
+                if FEATURE_REGISTRY is not None:
+                    df_feats = FEATURE_REGISTRY.compute_features(
+                        close, high=high, low=low, volume=vol,
+                        system_name=self.feature_system,
+                        dropna_after=True
+                    )
+                else:
+                    # Fallback to v1 if registry not available
+                    df_feats = fibo.add_technical_features(close, high=high, low=low, volume=vol, dropna_after=True)
+
+                # Attach metadata columns
+                for col in ("timestamp", "ts", "close"):
+                    if col in df.columns and col not in df_feats.columns:
+                        df_feats[col] = df[col].values[-len(df_feats):]
+
+                df_feats = df_feats.reset_index(drop=True)
+            except Exception as e:
+                self._enqueue_log(f"Multi-horizon feature creation failed: {e}", level=logging.ERROR)
+                return {}
+
+            if len(df_feats) < self.seq_len:
+                self._enqueue_log(f"Insufficient data after features: {len(df_feats)} < {self.seq_len}", level=logging.DEBUG)
+                return {}
+
+            # 3. Get feature columns
+            feature_cols = self.model_meta.get("feature_cols", [])
+            if not feature_cols:
+                # Only log once to avoid spam (waiting for model/metadata to load)
+                if not getattr(self, '_logged_no_features', False):
+                    self._enqueue_log("Waiting for model metadata to load...", level=logging.DEBUG)
+                    self._logged_no_features = True
+                return {}
+
+            # 4. Check if multi_horizon_fan_inference is available
+            try:
+                from multi_horizon_fan_inference import predict_single_point_multi_horizon
+            except ImportError:
+                self._enqueue_log("multi_horizon_fan_inference module not found", level=logging.ERROR)
+                return {}
+
+            # 5. Multi-horizon prediction
+            with self._artifact_lock:
+                if self.model is None or self.model_scaler is None:
+                    self._enqueue_log("Model or scaler not loaded", level=logging.WARNING)
+                    return {}
+
+                try:
+                    predictions = predict_single_point_multi_horizon(
+                        df=df_feats,
+                        model=self.model,
+                        meta=self.model_meta,
+                        scaler=self.model_scaler,
+                        device=self.device if self.device is not None else torch.device("cpu"),
+                        horizons=self.multi_horizon_horizons,
+                        method="scaling"
+                    )
+                except Exception as e:
+                    self._enqueue_log(f"Multi-horizon prediction failed: {e}", level=logging.ERROR)
+                    return {}
+
+            # 6. Push to queue for GUI
+            try:
+                self.predictions_queue.put_nowait(predictions)
+            except queue.Full:
+                # Queue full, discard oldest
+                try:
+                    self.predictions_queue.get_nowait()
+                    self.predictions_queue.put_nowait(predictions)
+                except Exception:
+                    pass
+
+            return predictions
+
+        except Exception as e:
+            self._enqueue_log(f"Multi-horizon inference error: {e}", level=logging.ERROR)
+            import traceback
+            self._enqueue_log(traceback.format_exc(), level=logging.DEBUG)
+            return {}
 
     # ----------------------------
     # Trading logic helpers

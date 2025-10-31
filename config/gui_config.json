@@ -1,15 +1,15 @@
 {
-  "sqlite_path": "C:/Users/soyko/Documents/git2/Market/cow_lvl-2oct/data_manager/exports/Binance_BTCUSDT_1h_fix.db",
+  "sqlite_path": "C:/Users/aladin/Documents/BitCorn_Farmer/data_manager/exports/Binance_BTCUSDT_1h.db",
   "table": "ohlcv",
   "symbol": "BTCUSDT",
   "timeframe": "1h",
-  "seq_len": 64,
-  "horizon": 12,
-  "hidden": 92,
-  "epochs": 20,
-  "batch_size": 32,
-  "lr": 0.0001,
-  "val_frac": 0.2,
+  "seq_len": 128,
+  "horizon": 6,
+  "hidden": 64,
+  "epochs": 2,
+  "batch_size": 64,
+  "lr": 0.0005,
+  "val_frac": 0.25,
   "dtype": "float32",
   "feature_cols_manual": ""
 }
