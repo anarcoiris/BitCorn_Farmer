@@ -787,13 +787,52 @@ def create_multi_tf_merged_df_from_base(
 # Sequences for LSTM
 # ==========================================
 def create_sequences_from_df(
-    df: pd.DataFrame, feature_cols: Sequence[str], seq_len: int = 32, horizon: int = 1
+    df: pd.DataFrame, feature_cols: Sequence[str], seq_len: int = 32, horizon: int = 1,
+    validate_gaps: bool = True, max_gap_multiplier: float = 2.0
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Create sequences for LSTM training/inference with optional timestamp gap validation.
+
+    Args:
+        df: DataFrame with features and 'close' column (optionally 'timestamp')
+        feature_cols: List of feature column names
+        seq_len: Sequence length for LSTM input
+        horizon: Prediction horizon (steps ahead)
+        validate_gaps: If True and 'timestamp' column exists, validate continuity
+        max_gap_multiplier: Maximum allowed gap as multiple of median delta (default 2.0)
+
+    Returns:
+        (X, y_ret, y_vol) arrays for training
+
+    Raises:
+        RuntimeError: If timestamp gaps detected that span discontinuities
+    """
     assert seq_len >= 1 and horizon >= 1
     dfc = df.reset_index(drop=True).copy()
 
     if "close" not in dfc.columns:
         raise RuntimeError("create_sequences_from_df expects column 'close' in df")
+
+    # Gap detection: Validate timestamp continuity if requested
+    if validate_gaps and "timestamp" in dfc.columns:
+        timestamps = pd.to_datetime(dfc["timestamp"])
+        deltas = timestamps.diff().iloc[1:]  # Skip first NaT
+
+        if len(deltas) > 0:
+            median_delta = deltas.median()
+            max_allowed_gap = median_delta * max_gap_multiplier
+
+            # Find gaps larger than threshold
+            gaps = deltas[deltas > max_allowed_gap]
+            if len(gaps) > 0:
+                gap_indices = gaps.index.tolist()
+                gap_details = [(idx, deltas.iloc[idx-1]) for idx in gap_indices]
+                LOGGER.warning(
+                    f"Detected {len(gaps)} timestamp gaps (>{max_gap_multiplier}x median delta). "
+                    f"First gap at index {gap_indices[0]}: {gap_details[0][1]}. "
+                    f"Median delta: {median_delta}. "
+                    "Sequences may span discontinuities. Consider splitting data or setting validate_gaps=False."
+                )
 
     present = [c for c in feature_cols if c in dfc.columns]
     if len(present) == 0:
@@ -831,6 +870,126 @@ def create_sequences_from_df(
     return X.astype(np.float32), y_ret.astype(np.float32), y_vol.astype(np.float32)
 
 
+def create_sequences_multihorizon(
+    df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    seq_len: int = 32,
+    horizons: Sequence[int] = (1, 3, 6, 12, 24),
+    validate_gaps: bool = True,
+    max_gap_multiplier: float = 2.0
+) -> Tuple[np.ndarray, Dict[int, np.ndarray], Dict[int, np.ndarray]]:
+    """
+    Create sequences for multi-horizon LSTM training.
+
+    Generates targets for ALL specified horizons simultaneously, enabling
+    efficient multi-output model training without scaling assumptions.
+
+    Args:
+        df: DataFrame with features and 'close' column
+        feature_cols: List of feature column names
+        seq_len: Sequence length for LSTM input
+        horizons: List of prediction horizons (e.g., [1, 3, 6, 12, 24])
+        validate_gaps: If True, validate timestamp continuity
+        max_gap_multiplier: Maximum allowed timestamp gap (multiple of median)
+
+    Returns:
+        X: Input sequences (N, seq_len, F)
+        y_ret: Dict mapping horizon -> return targets (N,)
+        y_vol: Dict mapping horizon -> volatility targets (N,)
+
+    Example:
+        >>> X, y_ret, y_vol = create_sequences_multihorizon(
+        ...     df, features, seq_len=64, horizons=[1,3,6,12,24]
+        ... )
+        >>> X.shape  # (N, 64, F)
+        >>> y_ret[1].shape  # (N,) targets for h=1
+        >>> y_ret[6].shape  # (N,) targets for h=6
+
+    Notes:
+        - Number of sequences N = len(df) - seq_len - max(horizons) + 1
+        - Fewer sequences than single-horizon due to max horizon requirement
+        - All targets computed from same input sequences (aligned training)
+    """
+    assert seq_len >= 1
+    assert len(horizons) > 0, "Must specify at least one horizon"
+
+    horizons = sorted(horizons)  # Ensure ascending order
+    max_horizon = horizons[-1]
+
+    dfc = df.reset_index(drop=True).copy()
+
+    if "close" not in dfc.columns:
+        raise RuntimeError("create_sequences_multihorizon expects column 'close' in df")
+
+    # Gap detection (shared logic with create_sequences_from_df)
+    if validate_gaps and "timestamp" in dfc.columns:
+        timestamps = pd.to_datetime(dfc["timestamp"])
+        deltas = timestamps.diff().iloc[1:]
+
+        if len(deltas) > 0:
+            median_delta = deltas.median()
+            max_allowed_gap = median_delta * max_gap_multiplier
+
+            gaps = deltas[deltas > max_allowed_gap]
+            if len(gaps) > 0:
+                gap_indices = gaps.index.tolist()
+                LOGGER.warning(
+                    f"Detected {len(gaps)} timestamp gaps in multi-horizon sequence creation. "
+                    f"First gap at index {gap_indices[0]}. "
+                    "Some sequences may span discontinuities."
+                )
+
+    present = [c for c in feature_cols if c in dfc.columns]
+    if len(present) == 0:
+        raise RuntimeError("No feature columns present after filtering.")
+
+    arr = dfc[present].astype(np.float32).values
+    close = dfc["close"].astype(np.float64).values
+
+    M = len(dfc)
+    N = M - seq_len - max_horizon + 1
+
+    if N <= 0:
+        raise ValueError(
+            f"Not enough rows for multi-horizon: need >= seq_len + max_horizon "
+            f"({seq_len} + {max_horizon} = {seq_len + max_horizon}), got {M}"
+        )
+
+    F = arr.shape[1]
+
+    # Allocate arrays
+    X = np.zeros((N, seq_len, F), dtype=np.float32)
+    y_ret = {h: np.zeros((N,), dtype=np.float32) for h in horizons}
+    y_vol = {h: np.zeros((N,), dtype=np.float32) for h in horizons}
+
+    if np.any(close <= 0):
+        raise RuntimeError("Non-positive close values present; cannot compute log-returns.")
+
+    logc = np.log(close)
+
+    # Generate sequences and targets for all horizons
+    for i in range(N):
+        # Input sequence (same for all horizons)
+        X[i] = arr[i : i + seq_len]
+        t0 = i + seq_len - 1  # Last timestep of input window
+
+        # Target for each horizon
+        for h in horizons:
+            t_h = t0 + h
+
+            # Log-return from t0 to t0+h
+            y_ret[h][i] = float(logc[t_h] - logc[t0])
+
+            # Volatility: std of returns in [t0+1, ..., t0+h]
+            if h >= 1:
+                rets = logc[t0 + 1 : t_h + 1] - logc[t0 : t_h]
+                y_vol[h][i] = float(np.std(rets, ddof=0)) if rets.size > 0 else 0.0
+            else:
+                y_vol[h][i] = 0.0
+
+    return X.astype(np.float32), y_ret, y_vol
+
+
 # ==========================================
 # LSTM model with two heads (ret, vol)
 # ==========================================
@@ -854,8 +1013,179 @@ if torch is not None:
             ret = self.head_ret(last).squeeze(-1)
             vol = self.head_vol(last).squeeze(-1)
             return ret, vol
+
+
+    class LSTMMultiHead(nn.Module):
+        """
+        Multi-horizon LSTM model with separate prediction heads for different horizons.
+
+        Architecture:
+        - Shared LSTM encoder (learns general temporal patterns)
+        - Separate (return, volatility) head pairs for each horizon
+        - Enables native predictions without scaling assumptions
+
+        Args:
+            input_size: Number of input features
+            hidden_size: LSTM hidden units (default 128 for multi-head capacity)
+            num_layers: LSTM layers (default 2)
+            dropout: Dropout rate for LSTM layers
+            horizons: List of prediction horizons (e.g., [1, 3, 6, 12, 24])
+            head_hidden_ratio: Ratio of head hidden size to LSTM hidden (default 0.5)
+
+        Returns:
+            Dict[int, Tuple[Tensor, Tensor]]: {horizon: (return_pred, vol_pred)}
+
+        Example:
+            >>> model = LSTMMultiHead(input_size=14, hidden_size=128, horizons=[1,3,6,12,24])
+            >>> x = torch.randn(32, 64, 14)  # (batch, seq_len, features)
+            >>> preds = model(x)
+            >>> ret_h1, vol_h1 = preds[1]  # Predictions for horizon=1
+        """
+        def __init__(
+            self,
+            input_size: int,
+            hidden_size: int = 128,
+            num_layers: int = 2,
+            dropout: float = 0.1,
+            horizons: Sequence[int] = (1, 3, 6, 12, 24),
+            head_hidden_ratio: float = 0.5
+        ):
+            super().__init__()
+            self.input_size = input_size
+            self.hidden_size = hidden_size
+            self.horizons = list(horizons)
+
+            # Shared LSTM encoder - learns general temporal patterns
+            self.lstm = nn.LSTM(
+                input_size,
+                hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=(dropout if num_layers > 1 else 0.0)
+            )
+
+            # Separate head pair (return, volatility) for each horizon
+            self.heads_ret = nn.ModuleDict()
+            self.heads_vol = nn.ModuleDict()
+
+            head_hidden = max(4, int(hidden_size * head_hidden_ratio))
+
+            for h in horizons:
+                h_key = str(h)
+
+                # Return head for horizon h
+                self.heads_ret[h_key] = nn.Sequential(
+                    nn.Linear(hidden_size, head_hidden),
+                    nn.ReLU(),
+                    nn.Linear(head_hidden, 1)
+                )
+
+                # Volatility head for horizon h (with Softplus for positivity)
+                self.heads_vol[h_key] = nn.Sequential(
+                    nn.Linear(hidden_size, head_hidden),
+                    nn.ReLU(),
+                    nn.Linear(head_hidden, 1),
+                    nn.Softplus()
+                )
+
+        def forward(self, x: torch.Tensor, horizon: Optional[int] = None) -> Union[Dict[int, Tuple[torch.Tensor, torch.Tensor]], Tuple[torch.Tensor, torch.Tensor]]:
+            """
+            Forward pass through the model.
+
+            Args:
+                x: Input tensor (batch_size, seq_len, input_size)
+                horizon: If specified, return only predictions for this horizon (for compatibility)
+                         If None, return predictions for all horizons
+
+            Returns:
+                If horizon is None: Dict mapping horizon -> (ret_pred, vol_pred)
+                If horizon is int: (ret_pred, vol_pred) for that horizon only
+            """
+            # Shared LSTM encoding
+            out, _ = self.lstm(x)
+            last = out[:, -1, :]  # (batch_size, hidden_size)
+
+            # Generate predictions for each horizon
+            if horizon is not None:
+                # Single horizon mode (for compatibility with LSTM2Head interface)
+                h_key = str(horizon)
+                if h_key not in self.heads_ret:
+                    raise ValueError(f"Horizon {horizon} not in trained horizons {self.horizons}")
+
+                ret = self.heads_ret[h_key](last).squeeze(-1)
+                vol = self.heads_vol[h_key](last).squeeze(-1)
+                return ret, vol
+
+            else:
+                # Multi-horizon mode (return dict)
+                predictions = {}
+                for h in self.horizons:
+                    h_key = str(h)
+                    ret = self.heads_ret[h_key](last).squeeze(-1)
+                    vol = self.heads_vol[h_key](last).squeeze(-1)
+                    predictions[h] = (ret, vol)
+
+                return predictions
+
+        def predict_interpolated(self, x: torch.Tensor, horizon: int) -> Tuple[torch.Tensor, torch.Tensor]:
+            """
+            Predict for arbitrary horizon using interpolation if not natively trained.
+
+            Args:
+                x: Input tensor (batch_size, seq_len, input_size)
+                horizon: Desired prediction horizon
+
+            Returns:
+                (ret_pred, vol_pred) interpolated for the requested horizon
+
+            Example:
+                >>> # Model trained on h=[1,3,6,12,24]
+                >>> # Want prediction for h=8 (not trained)
+                >>> ret_h8, vol_h8 = model.predict_interpolated(x, horizon=8)
+                >>> # Interpolates between h=6 and h=12 predictions
+            """
+            if horizon in self.horizons:
+                # Native prediction available
+                return self.forward(x, horizon=horizon)
+
+            # Find bracketing horizons
+            horizons_sorted = sorted(self.horizons)
+
+            if horizon < horizons_sorted[0]:
+                # Extrapolate down (use smallest horizon with warning scaling)
+                h_near = horizons_sorted[0]
+                scale = horizon / h_near
+                ret_near, vol_near = self.forward(x, horizon=h_near)
+                return ret_near * scale, vol_near * (scale ** 0.5)
+
+            elif horizon > horizons_sorted[-1]:
+                # Extrapolate up (use largest horizon with warning scaling)
+                h_near = horizons_sorted[-1]
+                scale = horizon / h_near
+                ret_near, vol_near = self.forward(x, horizon=h_near)
+                return ret_near * scale, vol_near * (scale ** 0.5)
+
+            else:
+                # Interpolate between two bracketing horizons
+                h_low = max([h for h in horizons_sorted if h < horizon])
+                h_high = min([h for h in horizons_sorted if h > horizon])
+
+                # Linear interpolation weight
+                weight_high = (horizon - h_low) / (h_high - h_low)
+                weight_low = 1.0 - weight_high
+
+                ret_low, vol_low = self.forward(x, horizon=h_low)
+                ret_high, vol_high = self.forward(x, horizon=h_high)
+
+                # Weighted blend
+                ret_interp = weight_low * ret_low + weight_high * ret_high
+                vol_interp = weight_low * vol_low + weight_high * vol_high
+
+                return ret_interp, vol_interp
+
 else:
     LSTM2Head = None
+    LSTMMultiHead = None
 
 
 # ==========================================
@@ -1037,6 +1367,486 @@ def eval_epoch(
             total_loss += float(loss.item()) * bs
             n += bs
     return total_loss / max(1, n)
+
+
+# ==========================================
+# Multi-Horizon Training Functions
+# ==========================================
+
+def multihorizon_loss(
+    predictions: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    targets_ret: Dict[int, torch.Tensor],
+    targets_vol: Dict[int, torch.Tensor],
+    horizon_weights: Optional[Dict[int, float]] = None,
+    alpha_vol: float = 0.5
+) -> Tuple[torch.Tensor, Dict[int, float]]:
+    """
+    Compute weighted multi-horizon loss.
+
+    Args:
+        predictions: Dict mapping horizon -> (pred_ret, pred_vol) tensors
+        targets_ret: Dict mapping horizon -> target_ret tensor
+        targets_vol: Dict mapping horizon -> target_vol tensor
+        horizon_weights: Optional dict of weights per horizon (default: uniform)
+        alpha_vol: Weight for volatility loss component
+
+    Returns:
+        total_loss: Weighted sum across all horizons
+        loss_per_horizon: Dict mapping horizon -> loss value (for monitoring)
+
+    Example:
+        >>> preds = model(x)  # {1: (ret1, vol1), 6: (ret6, vol6), ...}
+        >>> loss, losses_h = multihorizon_loss(preds, y_ret, y_vol, weights={1: 1.5, 6: 2.0})
+    """
+    if torch is None:
+        raise RuntimeError("torch not available")
+
+    horizons = sorted(predictions.keys())
+    mse = nn.MSELoss()
+
+    # Default uniform weights if not provided
+    if horizon_weights is None:
+        horizon_weights = {h: 1.0 for h in horizons}
+
+    # Normalize weights to sum to number of horizons (keeps loss magnitude consistent)
+    total_weight = sum(horizon_weights.get(h, 1.0) for h in horizons)
+    norm_weights = {h: horizon_weights.get(h, 1.0) * len(horizons) / total_weight for h in horizons}
+
+    total_loss = torch.tensor(0.0, device=next(iter(predictions.values()))[0].device)
+    loss_per_horizon = {}
+
+    for h in horizons:
+        pred_ret, pred_vol = predictions[h]
+        target_ret = targets_ret[h]
+        target_vol = targets_vol[h]
+
+        # Ensure 1D
+        pred_ret = _ensure_shape_1d(pred_ret)
+        pred_vol = _ensure_shape_1d(pred_vol)
+        target_ret = _ensure_shape_1d(target_ret)
+        target_vol = _ensure_shape_1d(target_vol)
+
+        # Per-horizon loss
+        loss_ret_h = mse(pred_ret, target_ret)
+        loss_vol_h = mse(pred_vol, target_vol)
+        loss_h = loss_ret_h + alpha_vol * loss_vol_h
+
+        # Weighted accumulation
+        weight_h = norm_weights[h]
+        total_loss = total_loss + weight_h * loss_h
+
+        # Track per-horizon for monitoring
+        loss_per_horizon[h] = float(loss_h.item())
+
+    return total_loss, loss_per_horizon
+
+
+class MultiHorizonDataset(torch.utils.data.Dataset):
+    """
+    Dataset for multi-horizon LSTM training.
+
+    Wraps X array and multi-horizon target dicts into a PyTorch Dataset.
+    """
+    def __init__(
+        self,
+        X: np.ndarray,
+        y_ret: Dict[int, np.ndarray],
+        y_vol: Dict[int, np.ndarray]
+    ):
+        """
+        Args:
+            X: Input sequences (N, seq_len, F)
+            y_ret: Dict mapping horizon -> return targets (N,)
+            y_vol: Dict mapping horizon -> volatility targets (N,)
+        """
+        self.X = torch.from_numpy(X).float()
+        self.horizons = sorted(y_ret.keys())
+
+        # Convert target dicts to tensors
+        self.y_ret = {h: torch.from_numpy(y_ret[h]).float() for h in self.horizons}
+        self.y_vol = {h: torch.from_numpy(y_vol[h]).float() for h in self.horizons}
+
+        self.N = X.shape[0]
+
+    def __len__(self):
+        return self.N
+
+    def __getitem__(self, idx):
+        x = self.X[idx]
+        y_ret_sample = {h: self.y_ret[h][idx] for h in self.horizons}
+        y_vol_sample = {h: self.y_vol[h][idx] for h in self.horizons}
+        return x, y_ret_sample, y_vol_sample
+
+
+def train_epoch_multihorizon(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    horizon_weights: Optional[Dict[int, float]] = None,
+    alpha_vol: float = 0.5,
+    grad_clip: float = 1.0
+) -> Tuple[float, Dict[int, float]]:
+    """
+    Train one epoch for multi-horizon model.
+
+    Args:
+        model: LSTMMultiHead instance
+        loader: DataLoader yielding (x, y_ret_dict, y_vol_dict)
+        optimizer: PyTorch optimizer
+        device: torch device
+        horizon_weights: Optional per-horizon loss weights
+        alpha_vol: Weight for volatility loss
+        grad_clip: Gradient clipping threshold
+
+    Returns:
+        avg_loss: Average loss across epoch
+        avg_losses_per_horizon: Dict of average loss per horizon
+    """
+    if torch is None:
+        raise RuntimeError("torch not available")
+
+    model.train()
+    total_loss = 0.0
+    n_samples = 0
+    horizon_losses_accum = {}
+
+    for batch in loader:
+        x_batch, y_ret_batch, y_vol_batch = batch
+
+        # Move to device
+        x_batch = x_batch.to(device)
+        y_ret_batch = {h: y.to(device) for h, y in y_ret_batch.items()}
+        y_vol_batch = {h: y.to(device) for h, y in y_vol_batch.items()}
+
+        # Forward pass (get predictions for all horizons)
+        optimizer.zero_grad(set_to_none=True)
+        predictions = model(x_batch)  # Returns dict {horizon: (ret, vol)}
+
+        # Compute loss
+        loss, losses_h = multihorizon_loss(
+            predictions, y_ret_batch, y_vol_batch,
+            horizon_weights=horizon_weights,
+            alpha_vol=alpha_vol
+        )
+
+        # Backward pass
+        loss.backward()
+
+        if grad_clip:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        optimizer.step()
+
+        # Accumulate stats
+        bs = x_batch.size(0)
+        total_loss += float(loss.item()) * bs
+        n_samples += bs
+
+        for h, loss_h in losses_h.items():
+            if h not in horizon_losses_accum:
+                horizon_losses_accum[h] = 0.0
+            horizon_losses_accum[h] += loss_h * bs
+
+    avg_loss = total_loss / max(1, n_samples)
+    avg_losses_per_horizon = {h: horizon_losses_accum[h] / max(1, n_samples) for h in horizon_losses_accum}
+
+    return avg_loss, avg_losses_per_horizon
+
+
+def eval_epoch_multihorizon(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    horizon_weights: Optional[Dict[int, float]] = None,
+    alpha_vol: float = 0.5
+) -> Tuple[float, Dict[int, float]]:
+    """
+    Evaluate one epoch for multi-horizon model.
+
+    Args:
+        model: LSTMMultiHead instance
+        loader: DataLoader yielding (x, y_ret_dict, y_vol_dict)
+        device: torch device
+        horizon_weights: Optional per-horizon loss weights
+        alpha_vol: Weight for volatility loss
+
+    Returns:
+        avg_loss: Average loss across epoch
+        avg_losses_per_horizon: Dict of average loss per horizon
+    """
+    if torch is None:
+        raise RuntimeError("torch not available")
+
+    model.eval()
+    total_loss = 0.0
+    n_samples = 0
+    horizon_losses_accum = {}
+
+    with torch.no_grad():
+        for batch in loader:
+            x_batch, y_ret_batch, y_vol_batch = batch
+
+            # Move to device
+            x_batch = x_batch.to(device)
+            y_ret_batch = {h: y.to(device) for h, y in y_ret_batch.items()}
+            y_vol_batch = {h: y.to(device) for h, y in y_vol_batch.items()}
+
+            # Forward pass
+            predictions = model(x_batch)
+
+            # Compute loss
+            loss, losses_h = multihorizon_loss(
+                predictions, y_ret_batch, y_vol_batch,
+                horizon_weights=horizon_weights,
+                alpha_vol=alpha_vol
+            )
+
+            # Accumulate stats
+            bs = x_batch.size(0)
+            total_loss += float(loss.item()) * bs
+            n_samples += bs
+
+            for h, loss_h in losses_h.items():
+                if h not in horizon_losses_accum:
+                    horizon_losses_accum[h] = 0.0
+                horizon_losses_accum[h] += loss_h * bs
+
+    avg_loss = total_loss / max(1, n_samples)
+    avg_losses_per_horizon = {h: horizon_losses_accum[h] / max(1, n_samples) for h in horizon_losses_accum}
+
+    return avg_loss, avg_losses_per_horizon
+
+
+def train_multihorizon_lstm(
+    df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    seq_len: int = 128,
+    horizons: Sequence[int] = (1, 3, 6, 12, 24),
+    hidden_size: int = 128,
+    num_layers: int = 2,
+    dropout: float = 0.1,
+    batch_size: int = 64,
+    epochs: int = 50,
+    lr: float = 0.001,
+    val_frac: float = 0.2,
+    horizon_weights: Optional[Dict[int, float]] = None,
+    alpha_vol: float = 0.5,
+    grad_clip: float = 1.0,
+    device: Optional[torch.device] = None,
+    early_stopping_patience: int = 10,
+    verbose: bool = True
+) -> Tuple[Any, Any, Dict]:
+    """
+    Train a multi-horizon LSTM model.
+
+    Comprehensive training pipeline for LSTMMultiHead architecture:
+    - Creates multi-horizon sequences from data
+    - Splits train/val temporally
+    - Trains model with weighted multi-horizon loss
+    - Implements early stopping
+    - Returns trained model, scaler, and metadata
+
+    Args:
+        df: DataFrame with features and 'close' column
+        feature_cols: List of feature column names
+        seq_len: Input sequence length
+        horizons: List of prediction horizons to train on
+        hidden_size: LSTM hidden units (128 recommended for multi-head)
+        num_layers: LSTM layers
+        dropout: Dropout rate
+        batch_size: Training batch size
+        epochs: Maximum training epochs
+        lr: Learning rate
+        val_frac: Validation fraction (temporal split)
+        horizon_weights: Optional per-horizon loss weights (e.g., {1: 1.5, 6: 2.0, 12: 1.0})
+        alpha_vol: Weight for volatility loss component
+        grad_clip: Gradient clipping threshold
+        device: torch device (auto-detected if None)
+        early_stopping_patience: Stop if no val improvement for N epochs
+        verbose: Print training progress
+
+    Returns:
+        model: Trained LSTMMultiHead
+        scaler: Fitted StandardScaler
+        metadata: Dict with training info (feature_cols, seq_len, horizons, metrics, etc.)
+
+    Example:
+        >>> model, scaler, meta = train_multihorizon_lstm(
+        ...     df, feature_cols=['close', 'volume', ...],
+        ...     seq_len=128, horizons=[1,3,6,12,24],
+        ...     hidden_size=128, epochs=50
+        ... )
+        >>> # Save artifacts
+        >>> save_model(model, 'artifacts/model.pt', meta=meta)
+        >>> save_scaler(scaler, 'artifacts/scaler.pkl', feature_cols=feature_cols)
+    """
+    if torch is None or StandardScaler is None:
+        raise RuntimeError("torch and scikit-learn required for training")
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if verbose:
+        LOGGER.info("="*70)
+        LOGGER.info("Multi-Horizon LSTM Training")
+        LOGGER.info("="*70)
+        LOGGER.info(f"Horizons: {horizons}")
+        LOGGER.info(f"Seq len: {seq_len}, Hidden: {hidden_size}, Layers: {num_layers}")
+        LOGGER.info(f"Device: {device}")
+
+    # Step 1: Prepare data with temporal split
+    df_local = df.copy().reset_index(drop=True)
+    df_local = df_local.dropna().reset_index(drop=True)
+
+    max_horizon = max(horizons)
+    n_total = len(df_local)
+    n_sequences = n_total - seq_len - max_horizon + 1
+
+    if n_sequences <= 0:
+        raise ValueError(f"Not enough data: need {seq_len + max_horizon} rows, got {n_total}")
+
+    # Temporal train/val split
+    n_val_seq = max(1, int(round(val_frac * n_sequences)))
+    n_train_seq = n_sequences - n_val_seq
+
+    if n_train_seq <= 0:
+        raise ValueError("val_frac too large")
+
+    train_rows_end = seq_len + n_train_seq - 1 + max_horizon
+
+    # Step 2: Fit scaler on training data only
+    scaler = StandardScaler()
+    scaler.fit(df_local[list(feature_cols)].iloc[:train_rows_end + 1].values.astype(np.float64))
+    scaler.feature_names_in_ = np.array(list(feature_cols), dtype=object)
+
+    # Transform entire dataset
+    df_local[list(feature_cols)] = scaler.transform(
+        df_local[list(feature_cols)].values.astype(np.float64)
+    ).astype(np.float32)
+
+    if verbose:
+        LOGGER.info(f"Data: {n_total} rows → {n_sequences} sequences")
+        LOGGER.info(f"Train: {n_train_seq} sequences, Val: {n_val_seq} sequences")
+
+    # Step 3: Create multi-horizon sequences
+    X_all, y_ret_all, y_vol_all = create_sequences_multihorizon(
+        df_local, feature_cols, seq_len=seq_len, horizons=horizons, validate_gaps=True
+    )
+
+    # Split train/val
+    X_train = X_all[:n_train_seq]
+    y_ret_train = {h: y_ret_all[h][:n_train_seq] for h in horizons}
+    y_vol_train = {h: y_vol_all[h][:n_train_seq] for h in horizons}
+
+    X_val = X_all[n_train_seq:]
+    y_ret_val = {h: y_ret_all[h][n_train_seq:] for h in horizons}
+    y_vol_val = {h: y_vol_all[h][n_train_seq:] for h in horizons}
+
+    # Step 4: Create datasets and loaders
+    train_dataset = MultiHorizonDataset(X_train, y_ret_train, y_vol_train)
+    val_dataset = MultiHorizonDataset(X_val, y_ret_val, y_vol_val)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Step 5: Initialize model
+    input_size = len(feature_cols)
+    model = LSTMMultiHead(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        horizons=horizons
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    if verbose:
+        n_params = sum(p.numel() for p in model.parameters())
+        LOGGER.info(f"Model: {n_params:,} parameters")
+
+    # Step 6: Training loop with early stopping
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(epochs):
+        # Train
+        train_loss, train_losses_h = train_epoch_multihorizon(
+            model, train_loader, optimizer, device,
+            horizon_weights=horizon_weights,
+            alpha_vol=alpha_vol,
+            grad_clip=grad_clip
+        )
+
+        # Validate
+        val_loss, val_losses_h = eval_epoch_multihorizon(
+            model, val_loader, device,
+            horizon_weights=horizon_weights,
+            alpha_vol=alpha_vol
+        )
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        # Early stopping check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            patience_counter += 1
+
+        # Logging
+        if verbose and (epoch % 5 == 0 or epoch == epochs - 1 or patience_counter == 0):
+            h_losses_str = ", ".join([f"h{h}={train_losses_h[h]:.6f}" for h in sorted(horizons)])
+            LOGGER.info(
+                f"Epoch {epoch+1:3d}/{epochs}: "
+                f"Train={train_loss:.6f} ({h_losses_str}), "
+                f"Val={val_loss:.6f}, "
+                f"Best={best_val_loss:.6f}"
+            )
+
+        # Early stopping
+        if patience_counter >= early_stopping_patience:
+            if verbose:
+                LOGGER.info(f"Early stopping at epoch {epoch+1} (no improvement for {early_stopping_patience} epochs)")
+            break
+
+    # Step 7: Restore best model
+    if best_model_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+        if verbose:
+            LOGGER.info(f"Restored best model (val_loss={best_val_loss:.6f})")
+
+    # Step 8: Compile metadata
+    metadata = {
+        'feature_cols': list(feature_cols),
+        'seq_len': seq_len,
+        'horizons': list(horizons),
+        'horizon': horizons[len(horizons)//2],  # Middle horizon for backward compat
+        'hidden': hidden_size,
+        'num_layers': num_layers,
+        'input_size': input_size,
+        'model_type': 'LSTMMultiHead',
+        'best_val_loss': best_val_loss,
+        'epochs_trained': epoch + 1,
+        'train_loss_history': train_losses,
+        'val_loss_history': val_losses,
+        'horizon_weights': horizon_weights,
+        'alpha_vol': alpha_vol
+    }
+
+    if verbose:
+        LOGGER.info("="*70)
+        LOGGER.info(f"Training complete! Best val loss: {best_val_loss:.6f}")
+        LOGGER.info("="*70)
+
+    return model, scaler, metadata
 
 
 # --- Fill simulation utilities (combined + liquidity-aware) ---
@@ -2475,4 +3285,3 @@ __all__ = [
     "detect_gaps",
     "validate_continuous_data",
 ]
-

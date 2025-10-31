@@ -537,16 +537,26 @@ def plot_predictions(
 
     fig, ax = plt.subplots(figsize=figsize)
 
-    # Plot historical close prices
-    if "timestamp" in df.columns:
-        x_hist = pd.to_datetime(df["timestamp"])
-    else:
-        x_hist = df.index
-
-    ax.plot(x_hist, df["close"], label="Historical Close", color="black", linewidth=1.5, alpha=0.7)
-
     # Plot predictions - SHIFT timestamps forward by horizon to show at prediction time
     horizon = predictions_df["horizon_steps"].iloc[0]
+
+    # Determine the cutoff point: plot historical data only up to the last prediction base time
+    # This prevents historical line from overlapping with future predictions
+    if "index" in predictions_df.columns:
+        last_prediction_base_idx = int(predictions_df["index"].max())
+    else:
+        # Fallback: use the prediction start point
+        last_prediction_base_idx = len(df) - horizon - 1
+
+    # Plot historical close prices (only up to where predictions begin projecting into future)
+    df_historical = df.iloc[:last_prediction_base_idx + horizon + 1].copy()
+
+    if "timestamp" in df_historical.columns:
+        x_hist = pd.to_datetime(df_historical["timestamp"])
+    else:
+        x_hist = df_historical.index
+
+    ax.plot(x_hist, df_historical["close"], label="Historical Close", color="black", linewidth=1.5, alpha=0.7)
 
     if "timestamp" in predictions_df.columns:
         x_pred = pd.to_datetime(predictions_df["timestamp"]) + pd.Timedelta(hours=horizon)
@@ -826,6 +836,310 @@ def main():
         # Show plots if in interactive mode
         if plt is not None:
             plt.show()
+
+
+def predict_multi_horizon_native(
+    df: pd.DataFrame,
+    model: nn.Module,
+    meta: Dict[str, Any],
+    scaler: Any,
+    device: torch.device,
+    n_predictions: int,
+    horizons: Optional[List[int]] = None,
+    start_idx: Optional[int] = None
+) -> Dict[int, pd.DataFrame]:
+    """
+    Generate native multi-horizon predictions using LSTMMultiHead model.
+
+    This function is designed for models that have been trained on multiple horizons
+    simultaneously (LSTMMultiHead). It returns predictions for each native horizon
+    without any scaling assumptions.
+
+    Process:
+    --------
+    For each time t from start_idx to start_idx + n_predictions:
+        1. Extract window of seq_len observations ending at t
+        2. Prepare features and scale using training scaler
+        3. Predict (return, volatility) for ALL trained horizons
+        4. Convert log-returns to prices for each horizon
+        5. Move to next time step (t+1)
+
+    Args:
+        df: DataFrame with OHLCV and features (must have 'close' column)
+        model: Trained LSTMMultiHead model
+        meta: Model metadata dict with feature_cols, seq_len, horizons
+        scaler: Fitted StandardScaler from training
+        device: torch.device for inference
+        n_predictions: Number of predictions to generate
+        horizons: Optional list of horizons to predict (defaults to model's native horizons)
+        start_idx: Starting index in df (if None, uses seq_len as minimum)
+
+    Returns:
+        Dict mapping horizon -> DataFrame with predictions for that horizon:
+        {
+            1: DataFrame with h=1 predictions,
+            3: DataFrame with h=3 predictions,
+            6: DataFrame with h=6 predictions,
+            ...
+        }
+
+        Each DataFrame contains:
+        - timestamp: prediction time
+        - close_current: current close price
+        - close_actual_future: actual future price at t+h
+        - close_pred: predicted close price at t+h
+        - log_return_pred: predicted log return
+        - volatility_pred: predicted volatility
+        - upper_bound_2std: upper CI
+        - lower_bound_2std: lower CI
+        - horizon_steps: h
+
+    Example:
+        >>> preds = predict_multi_horizon_native(df, model, meta, scaler, device, 100)
+        >>> preds_h1 = preds[1]  # Predictions for h=1
+        >>> preds_h6 = preds[6]  # Predictions for h=6
+    """
+    if torch is None or prepare_input_for_model is None:
+        raise RuntimeError("Required dependencies not available")
+
+    # Extract metadata
+    feature_cols = meta["feature_cols"]
+    seq_len = meta["seq_len"]
+
+    # Get horizons from model or meta
+    if horizons is None:
+        if "horizons" in meta:
+            horizons = meta["horizons"]
+        elif hasattr(model, "horizons"):
+            horizons = model.horizons
+        else:
+            raise ValueError("Could not determine horizons. Pass horizons parameter or include in metadata.")
+
+    max_horizon = max(horizons)
+
+    # Validate inputs
+    if "close" not in df.columns:
+        raise ValueError("DataFrame must contain 'close' column")
+
+    if len(df) < seq_len + max_horizon:
+        raise ValueError(f"DataFrame too short: need at least {seq_len + max_horizon} rows")
+
+    # Determine start index
+    if start_idx is None:
+        start_idx = seq_len
+    elif start_idx < 0:
+        start_idx = len(df) + start_idx
+        if start_idx < seq_len:
+            raise ValueError(f"start_idx resolves to {start_idx}, but minimum is {seq_len}")
+
+    # Validate we have enough data
+    max_idx = len(df) - max_horizon
+    if start_idx + n_predictions > max_idx:
+        available = max_idx - start_idx
+        warnings.warn(f"Requested {n_predictions} predictions but only {available} available. Adjusting.")
+        n_predictions = max(1, available)
+
+    # Storage for results (one list per horizon)
+    results_per_horizon = {h: [] for h in horizons}
+
+    logger.info(f"Generating {n_predictions} predictions starting from index {start_idx}")
+    logger.info(f"Native horizons: {horizons}")
+
+    model.eval()
+    with torch.no_grad():
+        for i in range(n_predictions):
+            t = start_idx + i
+
+            # Extract window ending at t
+            window_start = t - seq_len
+            window_end = t
+
+            if window_start < 0:
+                logger.warning(f"Skipping prediction at t={t}: insufficient history")
+                continue
+
+            window_df = df.iloc[window_start:window_end].copy()
+
+            # Get current price (end of window)
+            price_current = float(df.iloc[t - 1]["close"])
+
+            # Prepare input tensor
+            try:
+                input_tensor = prepare_input_for_model(
+                    window_df,
+                    feature_cols,
+                    seq_len,
+                    scaler=scaler,
+                    method="per_row"
+                ).to(device)
+            except Exception as e:
+                logger.error(f"Failed to prepare input at t={t}: {e}")
+                continue
+
+            # Generate predictions for all horizons
+            predictions = model(input_tensor)  # Returns dict {horizon: (ret, vol)}
+
+            # Get timestamp
+            if "timestamp" in df.columns:
+                ts = df.iloc[t - 1]["timestamp"]
+            else:
+                ts = t - 1
+
+            # Process each horizon
+            for h in horizons:
+                pred_ret, pred_vol = predictions[h]
+                pred_log_ret = float(pred_ret.cpu().numpy().ravel()[0])
+                pred_vol_val = float(pred_vol.cpu().numpy().ravel()[0])
+
+                # Get actual future price
+                future_idx = t - 1 + h
+                if future_idx < len(df):
+                    price_actual_future = float(df.iloc[future_idx]["close"])
+                else:
+                    price_actual_future = np.nan
+
+                # Convert log-return to price
+                price_pred = price_current * np.exp(pred_log_ret)
+
+                # Confidence intervals
+                upper_1std = price_current * np.exp(pred_log_ret + 1 * pred_vol_val)
+                lower_1std = price_current * np.exp(pred_log_ret - 1 * pred_vol_val)
+                upper_2std = price_current * np.exp(pred_log_ret + 2 * pred_vol_val)
+                lower_2std = price_current * np.exp(pred_log_ret - 2 * pred_vol_val)
+
+                result = {
+                    "index": t - 1,
+                    "timestamp": ts,
+                    "close_current": price_current,
+                    "close_actual_future": price_actual_future,
+                    "close_pred": price_pred,
+                    "log_return_pred": pred_log_ret,
+                    "volatility_pred": pred_vol_val,
+                    "upper_bound_1std": upper_1std,
+                    "lower_bound_1std": lower_1std,
+                    "upper_bound_2std": upper_2std,
+                    "lower_bound_2std": lower_2std,
+                    "horizon_steps": h
+                }
+
+                results_per_horizon[h].append(result)
+
+    # Convert to DataFrames
+    dfs = {}
+    for h in horizons:
+        df_h = pd.DataFrame(results_per_horizon[h])
+        if len(df_h) > 0:
+            # Add computed columns
+            df_h["prediction_error"] = df_h["close_actual_future"] - df_h["close_pred"]
+            df_h["prediction_error_pct"] = 100 * df_h["prediction_error"] / df_h["close_current"]
+            df_h["directionally_correct"] = np.sign(df_h["close_actual_future"] - df_h["close_current"]) == np.sign(df_h["close_pred"] - df_h["close_current"])
+        dfs[h] = df_h
+
+    logger.info(f"Generated {len(dfs)} horizon-specific prediction sets")
+    return dfs
+
+
+def detect_model_type(model: nn.Module, meta: Dict[str, Any]) -> str:
+    """
+    Detect whether model is LSTM2Head (single horizon) or LSTMMultiHead (multi-horizon).
+
+    Args:
+        model: PyTorch model instance
+        meta: Model metadata dict
+
+    Returns:
+        "multi" if LSTMMultiHead, "single" if LSTM2Head
+    """
+    # Check metadata first
+    if "model_type" in meta:
+        model_type = meta["model_type"]
+        if "Multi" in model_type:
+            return "multi"
+        return "single"
+
+    # Check model attributes
+    if hasattr(model, "horizons"):
+        return "multi"
+
+    # Check for multi-head structure
+    if hasattr(model, "heads_ret") or hasattr(model, "heads_vol"):
+        return "multi"
+
+    # Default to single
+    return "single"
+
+
+def predict_universal(
+    df: pd.DataFrame,
+    model: nn.Module,
+    meta: Dict[str, Any],
+    scaler: Any,
+    device: torch.device,
+    n_predictions: int,
+    horizon: Optional[int] = None,
+    start_idx: Optional[int] = None
+) -> Union[pd.DataFrame, Dict[int, pd.DataFrame]]:
+    """
+    Universal prediction function that automatically detects model type.
+
+    Supports both:
+    - LSTM2Head (single horizon with scaling)
+    - LSTMMultiHead (native multi-horizon)
+
+    Args:
+        df: DataFrame with OHLCV and features
+        model: Trained model (LSTM2Head or LSTMMultiHead)
+        meta: Model metadata dict
+        scaler: Fitted StandardScaler
+        device: torch.device
+        n_predictions: Number of predictions to generate
+        horizon: For LSTM2Head: the target horizon (uses scaling if different from native)
+                 For LSTMMultiHead: if specified, return only this horizon's predictions
+        start_idx: Starting index in df
+
+    Returns:
+        - If LSTM2Head or horizon specified: Single DataFrame with predictions
+        - If LSTMMultiHead and horizon=None: Dict mapping horizon -> DataFrame
+
+    Example:
+        >>> # Auto-detect and use appropriate method
+        >>> result = predict_universal(df, model, meta, scaler, device, 100)
+        >>> # For LSTMMultiHead, result is dict: {1: df1, 6: df6, ...}
+        >>> # For LSTM2Head, result is DataFrame
+    """
+    model_type = detect_model_type(model, meta)
+
+    if model_type == "multi":
+        logger.info("Detected LSTMMultiHead model - using native multi-horizon prediction")
+
+        # Get predictions for all horizons
+        preds_dict = predict_multi_horizon_native(
+            df, model, meta, scaler, device, n_predictions, start_idx=start_idx
+        )
+
+        # If specific horizon requested, return only that one
+        if horizon is not None:
+            if horizon in preds_dict:
+                return preds_dict[horizon]
+            else:
+                # Try interpolation if horizon not native
+                logger.warning(f"Horizon {horizon} not in native horizons {list(preds_dict.keys())}, using interpolation")
+                # For now, return closest horizon
+                horizons_sorted = sorted(preds_dict.keys())
+                closest = min(horizons_sorted, key=lambda h: abs(h - horizon))
+                logger.info(f"Using closest native horizon h={closest}")
+                return preds_dict[closest]
+
+        # Return all horizons
+        return preds_dict
+
+    else:  # model_type == "single"
+        logger.info("Detected LSTM2Head model - using single-horizon prediction (with scaling if needed)")
+
+        # Use existing jump prediction method
+        return predict_multi_horizon_jump(
+            df, model, meta, scaler, device, n_predictions, start_idx=start_idx
+        )
 
 
 if __name__ == "__main__":
