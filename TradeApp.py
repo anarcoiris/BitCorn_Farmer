@@ -1732,6 +1732,36 @@ class TradingAppExtended:
 
         return container, content
 
+    def _toggle_multihorizon_controls(self):
+        """Enable/disable multi-horizon controls based on checkbox state."""
+        state = "normal" if self.enable_multihorizon.get() else "disabled"
+
+        # Enable/disable all widgets in mh_frame
+        for child in self.mh_frame.winfo_children():
+            try:
+                if isinstance(child, (Entry, Checkbutton)):
+                    child.configure(state=state)
+                elif isinstance(child, Frame):
+                    # Recursively enable/disable widgets in nested frames
+                    for subchild in child.winfo_children():
+                        try:
+                            if isinstance(subchild, (Entry, Checkbutton, Label)):
+                                if isinstance(subchild, (Entry, Checkbutton)):
+                                    subchild.configure(state=state)
+                        except:
+                            pass
+            except:
+                pass
+
+        # Special handling for OptionMenus (they need their button's state changed)
+        try:
+            if hasattr(self, 'loss_type_menu') and self.loss_type_menu:
+                self.loss_type_menu.configure(state=state)
+            if hasattr(self, 'horizon_weighting_menu') and self.horizon_weighting_menu:
+                self.horizon_weighting_menu.configure(state=state)
+        except:
+            pass
+
     def _build_train_tab(self):
         tab = Frame(self.nb); self.nb.add(tab, text="Training")
         left = Frame(tab); left.pack(side=LEFT, fill=Y, padx=6, pady=6)
@@ -1759,6 +1789,90 @@ class TradingAppExtended:
 
         Label(config_frame, text="feature_cols (comma optional)").pack(anchor="w", pady=(6,0))
         Entry(config_frame, textvariable=self.feature_cols_manual, width=30).pack(anchor="w")
+
+        # Multi-Horizon Training Configuration
+        Label(config_frame, text="Multi-Horizon Training:", font=("Arial", 10, "bold")).pack(anchor="w", pady=(12,4))
+
+        # Enable checkbox
+        self.enable_multihorizon = BooleanVar(value=False)
+        frm_mh_enable = Frame(config_frame)
+        frm_mh_enable.pack(anchor="w", pady=2)
+        Checkbutton(frm_mh_enable, text="Enable Multi-Horizon",
+                   variable=self.enable_multihorizon,
+                   command=self._toggle_multihorizon_controls).pack(side=LEFT)
+        Label(frm_mh_enable, text="(trains n return + n volatility heads)",
+              font=("Arial", 8), fg="gray").pack(side=LEFT, padx=4)
+
+        # Multi-horizon options frame (disabled by default)
+        self.mh_frame = Frame(config_frame)
+        self.mh_frame.pack(anchor="w", pady=4, fill=X)
+
+        Label(self.mh_frame, text="Horizons (comma-separated):").pack(anchor="w")
+        self.horizons_var = StringVar(value="1,3,6,12,24")
+        Entry(self.mh_frame, textvariable=self.horizons_var, width=30, state="disabled").pack(anchor="w")
+
+        Label(self.mh_frame, text="Loss Type:").pack(anchor="w", pady=(4,0))
+        self.loss_type_var = StringVar(value="heteroscedastic_nll")
+        frm_loss = Frame(self.mh_frame)
+        frm_loss.pack(anchor="w")
+        OptionMenu(frm_loss, self.loss_type_var, "mse", "heteroscedastic_nll", "hybrid").pack(side=LEFT)
+        self.loss_type_menu = frm_loss.winfo_children()[0] if frm_loss.winfo_children() else None
+        Label(frm_loss, text="(MSE / NLL / Hybrid)", font=("Arial", 8)).pack(side=LEFT, padx=4)
+
+        Label(self.mh_frame, text="Horizon Weighting:").pack(anchor="w", pady=(4,0))
+        self.horizon_weighting_var = StringVar(value="inverse_variance")
+        frm_weight = Frame(self.mh_frame)
+        frm_weight.pack(anchor="w")
+        OptionMenu(frm_weight, self.horizon_weighting_var, "uniform", "inverse_variance", "inverse_horizon", "custom").pack(side=LEFT)
+        self.horizon_weighting_menu = frm_weight.winfo_children()[0] if frm_weight.winfo_children() else None
+        Label(frm_weight, text="(auto-computed)", font=("Arial", 8)).pack(side=LEFT, padx=4)
+
+        Label(self.mh_frame, text="Custom Weights (optional, if 'custom' selected):").pack(anchor="w", pady=(4,0))
+        self.horizon_weights_custom_var = StringVar(value="")
+        Entry(self.mh_frame, textvariable=self.horizon_weights_custom_var, width=30, state="disabled").pack(anchor="w")
+
+        # Advanced options
+        Label(self.mh_frame, text="Advanced Options:", font=("Arial", 9, "bold")).pack(anchor="w", pady=(6,2))
+
+        self.enable_directional_penalty_var = BooleanVar(value=True)
+        Checkbutton(self.mh_frame, text="Enable Directional Penalty",
+                   variable=self.enable_directional_penalty_var, state="disabled").pack(anchor="w")
+
+        frm_alpha_dir = Frame(self.mh_frame)
+        frm_alpha_dir.pack(anchor="w", pady=2)
+        Label(frm_alpha_dir, text="Alpha_dir:").pack(side=LEFT)
+        self.alpha_dir_var = StringVar(value="0.1")
+        Entry(frm_alpha_dir, textvariable=self.alpha_dir_var, width=10, state="disabled").pack(side=LEFT, padx=4)
+        Label(frm_alpha_dir, text="(directional weight)", font=("Arial", 8)).pack(side=LEFT)
+
+        frm_alpha_vol = Frame(self.mh_frame)
+        frm_alpha_vol.pack(anchor="w", pady=2)
+        Label(frm_alpha_vol, text="Alpha_vol:").pack(side=LEFT)
+        self.alpha_vol_var = StringVar(value="1.0")
+        Entry(frm_alpha_vol, textvariable=self.alpha_vol_var, width=10, state="disabled").pack(side=LEFT, padx=4)
+        Label(frm_alpha_vol, text="(return/vol balance)", font=("Arial", 8)).pack(side=LEFT)
+
+        self.auto_scale_vol_var = BooleanVar(value=True)
+        Checkbutton(self.mh_frame, text="Auto-scale volatility loss",
+                   variable=self.auto_scale_vol_var, state="disabled").pack(anchor="w")
+
+        # Monitoring options
+        Label(self.mh_frame, text="Monitoring:", font=("Arial", 9, "bold")).pack(anchor="w", pady=(6,2))
+
+        self.monitor_per_horizon_var = BooleanVar(value=True)
+        Checkbutton(self.mh_frame, text="Monitor per-horizon losses",
+                   variable=self.monitor_per_horizon_var, state="disabled").pack(anchor="w")
+
+        self.detect_interference_var = BooleanVar(value=True)
+        Checkbutton(self.mh_frame, text="Detect head interference",
+                   variable=self.detect_interference_var, state="disabled").pack(anchor="w")
+
+        frm_interference = Frame(self.mh_frame)
+        frm_interference.pack(anchor="w", pady=2)
+        Label(frm_interference, text="Interference threshold:").pack(side=LEFT)
+        self.interference_threshold_var = StringVar(value="10")
+        Entry(frm_interference, textvariable=self.interference_threshold_var, width=10, state="disabled").pack(side=LEFT, padx=4)
+        Label(frm_interference, text="%", font=("Arial", 8)).pack(side=LEFT)
 
         # Action buttons - always visible
         Label(left, text="Actions", font=("Arial",11,"bold")).pack(anchor="w", pady=(6,0))
@@ -3240,11 +3354,216 @@ class TradingAppExtended:
         t.start()
         self._enqueue_log("Training thread started.")
 
+    def _train_model_multihorizon(self):
+        """
+        Train multi-horizon LSTM using train_multihorizon_lstm().
+        Reads configuration from GUI, uses df_scaled, saves artifacts.
+        """
+        try:
+            if fibo is None or torch is None:
+                self._enqueue_log("fiboevo or PyTorch not available; cannot train.")
+                return
+
+            # 1. Parse horizons
+            horizons_str = self.horizons_var.get().strip()
+            try:
+                horizons = [int(h.strip()) for h in horizons_str.split(',') if h.strip()]
+                if not horizons:
+                    raise ValueError("Empty horizons list")
+            except Exception as e:
+                self._enqueue_log(f"Invalid horizons format: {e}. Use comma-separated integers (e.g., 1,3,6,12,24)")
+                return
+
+            # 2. Parse loss type
+            loss_type = self.loss_type_var.get()
+
+            # 3. Parse horizon weighting scheme
+            weighting_scheme = self.horizon_weighting_var.get()
+
+            horizon_weights = None
+            if weighting_scheme == "custom":
+                weights_str = self.horizon_weights_custom_var.get().strip()
+                if weights_str:
+                    try:
+                        weights_list = [float(w.strip()) for w in weights_str.split(',') if w.strip()]
+                        if len(weights_list) != len(horizons):
+                            raise ValueError(f"Weights count ({len(weights_list)}) must match horizons count ({len(horizons)})")
+                        horizon_weights = {h: w for h, w in zip(horizons, weights_list)}
+                    except Exception as e:
+                        self._enqueue_log(f"Invalid weights format: {e}. Using selected weighting scheme instead.")
+                        horizon_weights = None
+
+            elif weighting_scheme == "inverse_horizon":
+                horizon_weights = {h: 1.0 / h for h in horizons}
+
+            # inverse_variance and uniform are handled by train_multihorizon_lstm
+
+            # 4. Directional penalty
+            enable_directional = self.enable_directional_penalty_var.get()
+            try:
+                alpha_dir = float(self.alpha_dir_var.get()) if enable_directional else 0.0
+            except:
+                alpha_dir = 0.1 if enable_directional else 0.0
+
+            # 5. Return/vol balance
+            try:
+                alpha_vol = float(self.alpha_vol_var.get())
+            except:
+                alpha_vol = 1.0
+
+            auto_scale_vol = self.auto_scale_vol_var.get()
+
+            # 6. Monitoring options
+            monitor_per_horizon = self.monitor_per_horizon_var.get()
+            detect_interference = self.detect_interference_var.get()
+
+            try:
+                interference_threshold = float(self.interference_threshold_var.get()) / 100.0
+            except:
+                interference_threshold = 0.10
+
+            # Adaptive weighting (always enabled for inverse_variance scheme)
+            use_adaptive_weights = (weighting_scheme == "inverse_variance")
+
+            # 7. Get other hyperparameters from GUI
+            seq_len = int(self.seq_len.get())
+            hidden_size = int(self.hidden.get())
+            batch_size = int(self.batch_size.get())
+            epochs = int(self.epochs.get())
+            lr = float(self.lr.get())
+            val_frac = float(self.val_frac.get())
+
+            # 8. Check data availability
+            if self.df_scaled is None or self.feature_cols_used is None:
+                self._enqueue_log("No data prepared. Run 'Prepare Data' first.")
+                return
+
+            self._enqueue_log("="*70)
+            self._enqueue_log("Starting Multi-Horizon LSTM Training")
+            self._enqueue_log("="*70)
+            self._enqueue_log(f"Horizons: {horizons}")
+            self._enqueue_log(f"  → {len(horizons)} return heads + {len(horizons)} volatility heads = {len(horizons)*2} total heads")
+            self._enqueue_log(f"Seq len: {seq_len}, Hidden: {hidden_size}, Epochs: {epochs}")
+            self._enqueue_log(f"Feature cols: {self.feature_cols_used}")
+            self._enqueue_log(f"Loss type: {loss_type}")
+            self._enqueue_log(f"Weighting scheme: {weighting_scheme}")
+
+            if horizon_weights:
+                weights_str = ", ".join([f"h{h}={horizon_weights[h]:.3f}" for h in sorted(horizons)])
+                self._enqueue_log(f"Custom weights: {weights_str}")
+
+            if enable_directional:
+                self._enqueue_log(f"Directional penalty: α_dir={alpha_dir}")
+
+            self._enqueue_log(f"Alpha_vol: {alpha_vol} (auto-scale: {auto_scale_vol})")
+
+            # 9. Call fiboevo.train_multihorizon_lstm()
+            # Explicit CUDA detection
+            cuda_available = torch.cuda.is_available() if torch else False
+            if cuda_available:
+                device = torch.device("cuda")
+                cuda_name = torch.cuda.get_device_name(0)
+                self._enqueue_log(f"✓ CUDA detected: {cuda_name}")
+                self._enqueue_log(f"Using device: cuda:0")
+            else:
+                device = torch.device("cpu")
+                self._enqueue_log(f"⚠️  CUDA not available, using CPU")
+                self._enqueue_log(f"Training will be slower. Install CUDA-enabled PyTorch for GPU acceleration.")
+
+            # Prepare DataFrame (ensure 'close' column exists)
+            df_train = self.df_scaled.copy()
+            if 'close' not in df_train.columns:
+                self._enqueue_log("ERROR: df_scaled missing 'close' column")
+                return
+
+            # Train with full configuration
+            model, scaler, meta = fibo.train_multihorizon_lstm(
+                df=df_train,
+                feature_cols=self.feature_cols_used,
+                seq_len=seq_len,
+                horizons=horizons,
+                hidden_size=hidden_size,
+                num_layers=2,  # Could add UI control for this
+                dropout=0.1,   # Could add UI control for this
+                batch_size=batch_size,
+                epochs=epochs,
+                lr=lr,
+                val_frac=val_frac,
+
+                # Loss configuration
+                loss_type=loss_type,
+                horizon_weights=horizon_weights,
+                alpha_vol=alpha_vol,
+                alpha_dir=alpha_dir,
+                auto_scale_vol=auto_scale_vol,
+
+                # Adaptive weighting
+                use_adaptive_weights=use_adaptive_weights,
+
+                # Monitoring
+                monitor_per_horizon=monitor_per_horizon,
+                detect_interference=detect_interference,
+                interference_threshold=interference_threshold,
+
+                # Other
+                grad_clip=1.0,
+                device=device,
+                early_stopping_patience=10,
+                verbose=False  # We handle logging via _enqueue_log
+            )
+
+            # 10. Save artifacts
+            artifacts_dir = Path("artifacts")
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+            model_path = artifacts_dir / "model_best.pt"
+            scaler_path = artifacts_dir / "scaler.pkl"
+            meta_path = artifacts_dir / "meta.json"
+
+            # Save model
+            torch.save(model.state_dict(), str(model_path))
+            self._enqueue_log(f"Saved model to {model_path}")
+
+            # Save scaler
+            if joblib is not None:
+                joblib.dump(scaler, str(scaler_path))
+                self._enqueue_log(f"Saved scaler to {scaler_path}")
+
+            # Save metadata
+            import json
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            self._enqueue_log(f"Saved metadata to {meta_path}")
+
+            self._enqueue_log("="*70)
+            self._enqueue_log(f"Training complete! Best val loss: {meta.get('best_val_loss', 'N/A'):.6f}")
+            self._enqueue_log(f"Epochs trained: {meta.get('epochs_trained', 'N/A')}")
+
+            if meta.get('computed_weights'):
+                weights_str = ", ".join([f"h{h}={w:.3f}" for h, w in sorted(meta['computed_weights'].items())])
+                self._enqueue_log(f"Final adaptive weights: {weights_str}")
+
+            self._enqueue_log("="*70)
+
+            # 11. Store in instance
+            self.model = model
+            self.model_meta = meta
+            self.model_scaler = scaler
+
+        except Exception as e:
+            self._enqueue_log(f"Multi-horizon training failed: {e}")
+            self._enqueue_log(traceback.format_exc())
+
     def _train_model_worker(self):
         """Train model using self.X_full, self.y_full, self.feature_cols_used and scaler_used.
            Saves best model to artifacts/model_best.pt, scaler to artifacts/scaler.pkl and meta.json.
         """
         try:
+            # Check if multi-horizon training is enabled
+            if hasattr(self, 'enable_multihorizon') and self.enable_multihorizon.get():
+                self._train_model_multihorizon()  # Delegate to multi-horizon trainer
+                return
+
+            # Single-horizon training (original code path)
             if torch is None:
                 self._enqueue_log("PyTorch is not available; cannot train.")
                 return

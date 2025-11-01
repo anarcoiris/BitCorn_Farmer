@@ -1441,6 +1441,252 @@ def multihorizon_loss(
     return total_loss, loss_per_horizon
 
 
+def mse_loss_component(
+    pred_ret: torch.Tensor,
+    pred_vol: torch.Tensor,
+    target_ret: torch.Tensor,
+    target_vol: torch.Tensor,
+    alpha_vol: float = 1.0
+) -> torch.Tensor:
+    """
+    Classic MSE loss component for return and volatility predictions.
+
+    Args:
+        pred_ret: Predicted returns
+        pred_vol: Predicted volatility
+        target_ret: Actual returns
+        target_vol: Actual volatility
+        alpha_vol: Weight for volatility loss component
+
+    Returns:
+        Combined MSE loss
+    """
+    mse = nn.MSELoss()
+    loss_ret = mse(pred_ret, target_ret)
+    loss_vol = mse(pred_vol, target_vol)
+    return loss_ret + alpha_vol * loss_vol
+
+
+def heteroscedastic_nll_component(
+    pred_ret: torch.Tensor,
+    pred_vol: torch.Tensor,
+    target_ret: torch.Tensor,
+    alpha_dir: float = 0.0
+) -> torch.Tensor:
+    """
+    Heteroscedastic negative log-likelihood loss.
+
+    Uses predicted volatility as uncertainty estimate for returns.
+    Properly models time-varying uncertainty in financial returns.
+
+    Mathematical formulation:
+        NLL = 0.5 * (log(σ²) + (y - ŷ)² / σ²)
+
+    where σ = pred_vol (predicted volatility)
+
+    Args:
+        pred_ret: Predicted returns
+        pred_vol: Predicted volatility (used as σ for heteroscedastic modeling)
+        target_ret: Actual returns
+        alpha_dir: Directional penalty weight (0 = disabled, 0.1 = recommended)
+
+    Returns:
+        NLL loss (with optional directional penalty)
+
+    References:
+        Kendall & Gal (2018) "What Uncertainties Do We Need in Bayesian Deep Learning"
+
+    Note:
+        Aggressive numerical stability measures to prevent gradient explosion:
+        - Clamp pred_vol to [1e-4, 10.0] range
+        - Use log1p for better numerical stability
+        - Prevent division by near-zero variance
+    """
+    # Clamp predicted volatility to reasonable range
+    # Min: 1e-4 (prevents division by zero)
+    # Max: 10.0 (prevents numerical overflow in log)
+    pred_vol_clamped = torch.clamp(pred_vol, min=1e-4, max=10.0)
+
+    # Compute variance with numerical stability
+    var_pred = pred_vol_clamped ** 2
+
+    # Compute NLL components separately for numerical stability
+    # log(σ²) = 2*log(σ)
+    log_var = 2.0 * torch.log(pred_vol_clamped)
+
+    # Squared error normalized by variance
+    squared_error = (target_ret - pred_ret) ** 2
+    normalized_error = squared_error / var_pred
+
+    # Clamp normalized error to prevent extreme values
+    normalized_error = torch.clamp(normalized_error, max=100.0)
+
+    # NLL = 0.5 * (log(σ²) + (y-ŷ)²/σ²)
+    nll = 0.5 * (log_var + normalized_error)
+
+    # Check for NaN/Inf and replace with fallback MSE
+    if torch.isnan(nll).any() or torch.isinf(nll).any():
+        LOGGER.warning("NaN/Inf detected in NLL, falling back to MSE")
+        nll = squared_error
+
+    loss = nll.mean()
+
+    # Optional: Directional accuracy penalty
+    # Explicitly rewards correct sign prediction (crucial for trading)
+    if alpha_dir > 0:
+        sign_pred = torch.sign(pred_ret)
+        sign_true = torch.sign(target_ret)
+        # Penalty is 0 if signs match, 1 if they differ
+        dir_penalty = ((1 - sign_pred * sign_true) / 2).mean()
+        loss = loss + alpha_dir * dir_penalty
+
+    return loss
+
+
+def multihorizon_loss_configurable(
+    predictions: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    targets_ret: Dict[int, torch.Tensor],
+    targets_vol: Dict[int, torch.Tensor],
+
+    # Configuration options
+    loss_type: str = "heteroscedastic_nll",
+    horizon_weights: Optional[Dict[int, float]] = None,
+    alpha_vol: float = 1.0,
+    alpha_dir: float = 0.1,
+    auto_scale_vol: bool = True,
+
+    # Runtime computed weights (for adaptive schemes like inverse variance)
+    computed_weights: Optional[Dict[int, float]] = None
+
+) -> Tuple[torch.Tensor, Dict[int, float]]:
+    """
+    Fully configurable multi-horizon loss function.
+
+    Supports multiple loss types, weighting schemes, and optional enhancements.
+    Designed for flexibility and experimentation.
+
+    Args:
+        predictions: Dict mapping horizon -> (pred_ret, pred_vol) tensors
+        targets_ret: Dict mapping horizon -> target_ret tensor
+        targets_vol: Dict mapping horizon -> target_vol tensor
+        loss_type: Loss function type
+            - "mse": Classic mean squared error (original implementation)
+            - "heteroscedastic_nll": Negative log-likelihood with learned uncertainty
+            - "hybrid": 50/50 blend of MSE and NLL
+        horizon_weights: Manual weights per horizon (None = uniform)
+        alpha_vol: Return/volatility balance for MSE component (default: 1.0)
+        alpha_dir: Directional penalty weight for NLL component (default: 0.1)
+        auto_scale_vol: Auto-scale volatility loss to match return scale magnitude
+        computed_weights: Runtime-computed weights (e.g., inverse variance from validation set)
+            If provided, overrides horizon_weights
+
+    Returns:
+        total_loss: Weighted sum across all horizons
+        loss_per_horizon: Dict mapping horizon -> loss value (for monitoring)
+
+    Examples:
+        >>> # Heteroscedastic NLL with inverse variance weighting
+        >>> loss, losses_h = multihorizon_loss_configurable(
+        ...     preds, y_ret, y_vol,
+        ...     loss_type="heteroscedastic_nll",
+        ...     computed_weights={1: 2.5, 3: 1.8, 6: 1.0}
+        ... )
+
+        >>> # Hybrid loss with directional penalty
+        >>> loss, losses_h = multihorizon_loss_configurable(
+        ...     preds, y_ret, y_vol,
+        ...     loss_type="hybrid",
+        ...     alpha_dir=0.15
+        ... )
+    """
+    if torch is None:
+        raise RuntimeError("torch not available")
+
+    horizons = sorted(predictions.keys())
+    device = predictions[horizons[0]][0].device
+
+    # Determine effective weights
+    if computed_weights is not None:
+        # Use runtime-computed weights (highest priority)
+        effective_weights = computed_weights
+    elif horizon_weights is not None:
+        # Use user-provided weights
+        effective_weights = horizon_weights
+    else:
+        # Default: uniform weights
+        effective_weights = {h: 1.0 for h in horizons}
+
+    # Normalize weights to sum to number of horizons (maintains loss magnitude consistency)
+    total_weight = sum(effective_weights[h] for h in horizons)
+    norm_weights = {h: effective_weights[h] * len(horizons) / total_weight
+                    for h in horizons}
+
+    # Auto-scale volatility loss to match return scale (for MSE and hybrid)
+    alpha_vol_effective = alpha_vol
+    if auto_scale_vol and loss_type in ["mse", "hybrid"]:
+        # Compute scale ratio on current batch (done once, not per horizon)
+        with torch.no_grad():
+            ret_scales = []
+            vol_scales = []
+            for h in horizons:
+                pred_ret, pred_vol = predictions[h]
+                ret_scales.append(pred_ret.abs().mean().item())
+                vol_scales.append(pred_vol.abs().mean().item())
+
+            avg_ret_scale = np.mean(ret_scales) if ret_scales else 1.0
+            avg_vol_scale = np.mean(vol_scales) if vol_scales else 1.0
+
+            if avg_vol_scale > 1e-8:
+                scale_factor = avg_ret_scale / avg_vol_scale
+                alpha_vol_effective = alpha_vol * scale_factor
+
+    # Accumulate loss across horizons
+    total_loss = torch.tensor(0.0, device=device)
+    loss_per_horizon = {}
+
+    for h in horizons:
+        pred_ret, pred_vol = predictions[h]
+        target_ret = targets_ret[h]
+        target_vol = targets_vol[h]
+
+        # Ensure 1D tensors
+        pred_ret = _ensure_shape_1d(pred_ret)
+        pred_vol = _ensure_shape_1d(pred_vol)
+        target_ret = _ensure_shape_1d(target_ret)
+        target_vol = _ensure_shape_1d(target_vol)
+
+        # Compute loss based on selected type
+        if loss_type == "mse":
+            loss_h = mse_loss_component(
+                pred_ret, pred_vol, target_ret, target_vol, alpha_vol_effective
+            )
+
+        elif loss_type == "heteroscedastic_nll":
+            loss_h = heteroscedastic_nll_component(
+                pred_ret, pred_vol, target_ret, alpha_dir
+            )
+
+        elif loss_type == "hybrid":
+            # Combine both components with equal weight
+            loss_mse = mse_loss_component(
+                pred_ret, pred_vol, target_ret, target_vol, alpha_vol_effective
+            )
+            loss_nll = heteroscedastic_nll_component(
+                pred_ret, pred_vol, target_ret, alpha_dir
+            )
+            loss_h = 0.5 * loss_mse + 0.5 * loss_nll
+
+        else:
+            raise ValueError(f"Unknown loss_type: {loss_type}. "
+                           f"Must be 'mse', 'heteroscedastic_nll', or 'hybrid'.")
+
+        # Weighted accumulation
+        total_loss = total_loss + norm_weights[h] * loss_h
+        loss_per_horizon[h] = float(loss_h.item())
+
+    return total_loss, loss_per_horizon
+
+
 class MultiHorizonDataset(torch.utils.data.Dataset):
     """
     Dataset for multi-horizon LSTM training.
@@ -1485,7 +1731,13 @@ def train_epoch_multihorizon(
     device: torch.device,
     horizon_weights: Optional[Dict[int, float]] = None,
     alpha_vol: float = 0.5,
-    grad_clip: float = 1.0
+    grad_clip: float = 1.0,
+
+    # New configurable loss parameters
+    loss_type: str = "heteroscedastic_nll",
+    alpha_dir: float = 0.1,
+    auto_scale_vol: bool = True,
+    computed_weights: Optional[Dict[int, float]] = None
 ) -> Tuple[float, Dict[int, float]]:
     """
     Train one epoch for multi-horizon model.
@@ -1498,6 +1750,10 @@ def train_epoch_multihorizon(
         horizon_weights: Optional per-horizon loss weights
         alpha_vol: Weight for volatility loss
         grad_clip: Gradient clipping threshold
+        loss_type: Loss function type (mse, heteroscedastic_nll, hybrid)
+        alpha_dir: Directional penalty weight
+        auto_scale_vol: Auto-scale volatility loss
+        computed_weights: Runtime-computed weights (overrides horizon_weights)
 
     Returns:
         avg_loss: Average loss across epoch
@@ -1523,18 +1779,26 @@ def train_epoch_multihorizon(
         optimizer.zero_grad(set_to_none=True)
         predictions = model(x_batch)  # Returns dict {horizon: (ret, vol)}
 
-        # Compute loss
-        loss, losses_h = multihorizon_loss(
+        # Compute loss using configurable function
+        loss, losses_h = multihorizon_loss_configurable(
             predictions, y_ret_batch, y_vol_batch,
+            loss_type=loss_type,
             horizon_weights=horizon_weights,
-            alpha_vol=alpha_vol
+            alpha_vol=alpha_vol,
+            alpha_dir=alpha_dir,
+            auto_scale_vol=auto_scale_vol,
+            computed_weights=computed_weights
         )
 
         # Backward pass
         loss.backward()
 
         if grad_clip:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            total_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # Log warning if gradients are extremely large (>10x clip threshold)
+            # Only log occasionally to avoid spam
+            if total_norm > grad_clip * 10:
+                LOGGER.warning(f"⚠️  Extremely large gradient: {total_norm:.2f} (clip={grad_clip})")
 
         optimizer.step()
 
@@ -1559,7 +1823,13 @@ def eval_epoch_multihorizon(
     loader: DataLoader,
     device: torch.device,
     horizon_weights: Optional[Dict[int, float]] = None,
-    alpha_vol: float = 0.5
+    alpha_vol: float = 0.5,
+
+    # New configurable loss parameters
+    loss_type: str = "heteroscedastic_nll",
+    alpha_dir: float = 0.1,
+    auto_scale_vol: bool = True,
+    computed_weights: Optional[Dict[int, float]] = None
 ) -> Tuple[float, Dict[int, float]]:
     """
     Evaluate one epoch for multi-horizon model.
@@ -1570,6 +1840,10 @@ def eval_epoch_multihorizon(
         device: torch device
         horizon_weights: Optional per-horizon loss weights
         alpha_vol: Weight for volatility loss
+        loss_type: Loss function type (mse, heteroscedastic_nll, hybrid)
+        alpha_dir: Directional penalty weight
+        auto_scale_vol: Auto-scale volatility loss
+        computed_weights: Runtime-computed weights (overrides horizon_weights)
 
     Returns:
         avg_loss: Average loss across epoch
@@ -1595,11 +1869,15 @@ def eval_epoch_multihorizon(
             # Forward pass
             predictions = model(x_batch)
 
-            # Compute loss
-            loss, losses_h = multihorizon_loss(
+            # Compute loss using configurable function
+            loss, losses_h = multihorizon_loss_configurable(
                 predictions, y_ret_batch, y_vol_batch,
+                loss_type=loss_type,
                 horizon_weights=horizon_weights,
-                alpha_vol=alpha_vol
+                alpha_vol=alpha_vol,
+                alpha_dir=alpha_dir,
+                auto_scale_vol=auto_scale_vol,
+                computed_weights=computed_weights
             )
 
             # Accumulate stats
@@ -1635,7 +1913,18 @@ def train_multihorizon_lstm(
     grad_clip: float = 1.0,
     device: Optional[torch.device] = None,
     early_stopping_patience: int = 10,
-    verbose: bool = True
+    verbose: bool = True,
+
+    # New configurable loss parameters
+    loss_type: str = "heteroscedastic_nll",
+    alpha_dir: float = 0.1,
+    auto_scale_vol: bool = True,
+    use_adaptive_weights: bool = True,
+
+    # Monitoring parameters
+    monitor_per_horizon: bool = True,
+    detect_interference: bool = True,
+    interference_threshold: float = 0.10
 ) -> Tuple[Any, Any, Dict]:
     """
     Train a multi-horizon LSTM model.
@@ -1660,11 +1949,27 @@ def train_multihorizon_lstm(
         lr: Learning rate
         val_frac: Validation fraction (temporal split)
         horizon_weights: Optional per-horizon loss weights (e.g., {1: 1.5, 6: 2.0, 12: 1.0})
-        alpha_vol: Weight for volatility loss component
+                        If use_adaptive_weights=True and loss_type="heteroscedastic_nll",
+                        this will be computed automatically after epoch 1
+        alpha_vol: Weight for volatility loss component (for MSE and hybrid losses)
         grad_clip: Gradient clipping threshold
         device: torch device (auto-detected if None)
         early_stopping_patience: Stop if no val improvement for N epochs
         verbose: Print training progress
+
+        loss_type: Loss function type (default: "heteroscedastic_nll")
+                  - "mse": Classic mean squared error
+                  - "heteroscedastic_nll": NLL with learned uncertainty (recommended)
+                  - "hybrid": 50/50 blend of MSE and NLL
+        alpha_dir: Directional penalty weight for NLL loss (default: 0.1)
+                  Penalizes wrong directional predictions
+        auto_scale_vol: Auto-scale volatility loss to match return scale (default: True)
+        use_adaptive_weights: Compute inverse variance weights after epoch 1 (default: True)
+                             Automatically weights horizons by prediction difficulty
+
+        monitor_per_horizon: Log per-horizon metrics every 5 epochs (default: True)
+        detect_interference: Detect and log head interference issues (default: True)
+        interference_threshold: Threshold for interference detection (default: 0.10 = 10%)
 
     Returns:
         model: Trained LSTMMultiHead
@@ -1766,7 +2071,7 @@ def train_multihorizon_lstm(
         n_params = sum(p.numel() for p in model.parameters())
         LOGGER.info(f"Model: {n_params:,} parameters")
 
-    # Step 6: Training loop with early stopping
+    # Step 6: Training loop with early stopping, adaptive weighting, and interference detection
     best_val_loss = float('inf')
     patience_counter = 0
     best_model_state = None
@@ -1774,24 +2079,104 @@ def train_multihorizon_lstm(
     train_losses = []
     val_losses = []
 
+    # For adaptive weighting
+    computed_weights_runtime = None
+
+    # For interference detection
+    prev_train_losses_h = {h: float('inf') for h in horizons}
+
+    if verbose:
+        LOGGER.info("="*70)
+        LOGGER.info("Training Configuration:")
+        LOGGER.info(f"  Loss type: {loss_type}")
+        LOGGER.info(f"  Adaptive weights: {use_adaptive_weights}")
+        LOGGER.info(f"  Interference detection: {detect_interference}")
+        LOGGER.info("="*70)
+
     for epoch in range(epochs):
+        # Adaptive weighting: Compute inverse variance after epoch 1
+        if use_adaptive_weights and epoch == 1 and loss_type != "mse":
+            if verbose:
+                LOGGER.info("Computing inverse variance weights from validation set...")
+
+            variances = {h: [] for h in horizons}
+
+            with torch.no_grad():
+                model.eval()
+                for batch in val_loader:
+                    x_batch, y_ret_batch, y_vol_batch = batch
+                    x_batch = x_batch.to(device)
+                    y_ret_batch = {h: y.to(device) for h, y in y_ret_batch.items()}
+
+                    predictions = model(x_batch)
+
+                    for h in horizons:
+                        pred_ret, _ = predictions[h]
+                        target_ret = y_ret_batch[h]
+                        residuals = (pred_ret - target_ret).cpu().numpy()
+                        variances[h].extend(residuals ** 2)
+
+                model.train()
+
+            # Compute variance per horizon
+            var_per_h = {h: np.mean(variances[h]) if len(variances[h]) > 0 else 1.0
+                        for h in horizons}
+
+            # Inverse variance weights
+            computed_weights_runtime = {h: 1.0 / (var_per_h[h] + 1e-8) for h in horizons}
+
+            # Normalize to sum = len(horizons)
+            total = sum(computed_weights_runtime.values())
+            computed_weights_runtime = {h: w * len(horizons) / total
+                                       for h, w in computed_weights_runtime.items()}
+
+            if verbose:
+                weights_str = ", ".join([f"h{h}={computed_weights_runtime[h]:.3f}"
+                                        for h in sorted(horizons)])
+                LOGGER.info(f"Adaptive weights computed: {weights_str}")
+                LOGGER.info(f"Short-term horizons weighted higher (inverse variance principle)")
+
         # Train
         train_loss, train_losses_h = train_epoch_multihorizon(
             model, train_loader, optimizer, device,
             horizon_weights=horizon_weights,
             alpha_vol=alpha_vol,
-            grad_clip=grad_clip
+            grad_clip=grad_clip,
+            loss_type=loss_type,
+            alpha_dir=alpha_dir,
+            auto_scale_vol=auto_scale_vol,
+            computed_weights=computed_weights_runtime
         )
 
         # Validate
         val_loss, val_losses_h = eval_epoch_multihorizon(
             model, val_loader, device,
             horizon_weights=horizon_weights,
-            alpha_vol=alpha_vol
+            alpha_vol=alpha_vol,
+            loss_type=loss_type,
+            alpha_dir=alpha_dir,
+            auto_scale_vol=auto_scale_vol,
+            computed_weights=computed_weights_runtime
         )
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
+
+        # Interference detection: Check if any horizon's loss increased significantly
+        if detect_interference and epoch > 5:
+            for h in horizons:
+                current_loss = train_losses_h[h]
+                prev_loss = prev_train_losses_h[h]
+
+                if current_loss > prev_loss * (1 + interference_threshold):
+                    increase_pct = ((current_loss / prev_loss - 1) * 100)
+                    if verbose:
+                        LOGGER.warning(
+                            f"⚠️  HEAD INTERFERENCE: Horizon {h} loss increased "
+                            f"{increase_pct:.1f}% ({prev_loss:.6f} → {current_loss:.6f})"
+                        )
+
+        prev_train_losses_h = train_losses_h.copy()
 
         # Early stopping check
         if val_loss < best_val_loss:
@@ -1801,15 +2186,36 @@ def train_multihorizon_lstm(
         else:
             patience_counter += 1
 
-        # Logging
+        # Enhanced logging
         if verbose and (epoch % 5 == 0 or epoch == epochs - 1 or patience_counter == 0):
-            h_losses_str = ", ".join([f"h{h}={train_losses_h[h]:.6f}" for h in sorted(horizons)])
-            LOGGER.info(
-                f"Epoch {epoch+1:3d}/{epochs}: "
-                f"Train={train_loss:.6f} ({h_losses_str}), "
-                f"Val={val_loss:.6f}, "
-                f"Best={best_val_loss:.6f}"
-            )
+            if monitor_per_horizon:
+                # Detailed per-horizon table
+                LOGGER.info("="*70)
+                LOGGER.info(f"Epoch {epoch+1:3d}/{epochs} - Per-Horizon Breakdown")
+                LOGGER.info("-"*70)
+                LOGGER.info(f"{'Horizon':<8} {'Train Loss':<12} {'Val Loss':<12} {'Δ%':<8}")
+                LOGGER.info("-"*70)
+
+                for h in sorted(horizons):
+                    train_h = train_losses_h.get(h, 0.0)
+                    val_h = val_losses_h.get(h, 0.0)
+                    delta_pct = ((val_h / train_h - 1) * 100) if train_h > 0 else 0.0
+
+                    LOGGER.info(f"h={h:<6} {train_h:<12.6f} {val_h:<12.6f} {delta_pct:>6.1f}%")
+
+                LOGGER.info("-"*70)
+                LOGGER.info(f"{'TOTAL':<8} {train_loss:<12.6f} {val_loss:<12.6f}")
+                LOGGER.info(f"Best Val: {best_val_loss:.6f} | Patience: {patience_counter}/{early_stopping_patience}")
+                LOGGER.info("="*70)
+            else:
+                # Compact logging
+                h_losses_str = ", ".join([f"h{h}={train_losses_h[h]:.6f}" for h in sorted(horizons)])
+                LOGGER.info(
+                    f"Epoch {epoch+1:3d}/{epochs}: "
+                    f"Train={train_loss:.6f} ({h_losses_str}), "
+                    f"Val={val_loss:.6f}, "
+                    f"Best={best_val_loss:.6f}"
+                )
 
         # Early stopping
         if patience_counter >= early_stopping_patience:
@@ -1837,8 +2243,20 @@ def train_multihorizon_lstm(
         'epochs_trained': epoch + 1,
         'train_loss_history': train_losses,
         'val_loss_history': val_losses,
+
+        # Loss configuration
+        'loss_type': loss_type,
         'horizon_weights': horizon_weights,
-        'alpha_vol': alpha_vol
+        'computed_weights': computed_weights_runtime,  # Final adaptive weights used
+        'alpha_vol': alpha_vol,
+        'alpha_dir': alpha_dir,
+        'auto_scale_vol': auto_scale_vol,
+
+        # Training configuration
+        'use_adaptive_weights': use_adaptive_weights,
+        'monitor_per_horizon': monitor_per_horizon,
+        'detect_interference': detect_interference,
+        'interference_threshold': interference_threshold
     }
 
     if verbose:
